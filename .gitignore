@@ -1,0 +1,10 @@
+# Ignore environment files containing secrets
+.env
+Backend/.env
+
+# Node/Vite build artifacts
+node_modules/
+dist/
+
+# Python virtualenv
+Backend/myenv/
