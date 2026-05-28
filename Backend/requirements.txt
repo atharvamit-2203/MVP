@@ -4,6 +4,7 @@ torchvision
 torchaudio
 easyocr
 paddleocr
+paddlepaddle
 pytesseract
 opencv-python
 Pillow
@@ -11,6 +12,8 @@ numpy
 pandas
 scipy
 scikit-image
+scikit-learn
+joblib
 shapely
 networkx
 pydantic
