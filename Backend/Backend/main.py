@@ -19,6 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from coordinate_detection import detect_coordinates
+
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(BACKEND_ROOT / ".env")
@@ -80,6 +82,41 @@ class DetectionResponse(BaseModel):
 	page_count: int = Field(..., ge=1)
 	models_used: list[str]
 	pages: list[PageDetectionResult]
+	industry: str | None = None
+
+
+class ComponentPosition(BaseModel):
+	x: int = Field(..., ge=0)
+	y: int = Field(..., ge=0)
+	width: int = Field(..., ge=0)
+	height: int = Field(..., ge=0)
+
+
+class ComponentMeta(BaseModel):
+	name: str
+
+
+class ComponentChild(BaseModel):
+	meta: ComponentMeta
+	position: ComponentPosition
+	type: str
+
+
+class RootMeta(BaseModel):
+	name: str
+
+
+class Root(BaseModel):
+	children: list[ComponentChild]
+	meta: RootMeta
+	type: str
+
+
+class CoordinateDetectionResponse(BaseModel):
+	custom: dict[str, Any]
+	params: dict[str, Any]
+	props: dict[str, Any]
+	root: Root
 
 
 CategoryCounts.model_rebuild()
@@ -156,7 +193,7 @@ def get_openrouter_config() -> dict[str, str]:
 		"site_url": os.getenv("OPENROUTER_SITE_URL", "http://localhost:8000"),
 		"app_name": os.getenv("OPENROUTER_APP_NAME", "Sarla P&ID Detector"),
 		"qwen_max_tokens": os.getenv("OPENROUTER_QWEN_MAX_TOKENS", "800"),
-		"claude_max_tokens": os.getenv("OPENROUTER_CLAUDE_MAX_TOKENS", "400"),
+	        "claude_max_tokens": os.getenv("OPENROUTER_CLAUDE_MAX_TOKENS", "380"),
 	}
 
 
@@ -332,6 +369,16 @@ def build_verification_prompt(candidate_json: str) -> str:
 	)
 
 
+def build_industry_detection_prompt() -> str:
+	return (
+		"Analyze this P&ID (Piping and Instrumentation Diagram) image and identify which industry it belongs to. "
+		"Common industries include: Oil & Gas, Chemical Processing, Water Treatment, Power Generation, "
+		"Pharmaceutical, Food & Beverage, Manufacturing, or Other. "
+		"Return only the industry name as a single word or short phrase (e.g., 'Oil & Gas', 'Chemical Processing'). "
+		"Do not include any explanation or additional text."
+	)
+
+
 def build_response_format() -> dict[str, Any]:
 	return {
 		"type": "json_schema",
@@ -390,6 +437,84 @@ def extract_message_text(message: Any) -> str:
 							return candidate[nested_key]
 
 	return coerce_message_content(message)
+
+
+def detect_industry(image: Image.Image, config: dict[str, str]) -> str:
+	prepared_image = resize_for_model(image)
+	encoded_image = image_to_base64_png(prepared_image)
+	
+	payload = {
+		"model": config["qwen_model"],
+		"max_tokens": 100,
+		"messages": [
+			{
+				"role": "system",
+				"content": "You are an expert at analyzing P&ID diagrams and identifying their industry context.",
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": build_industry_detection_prompt()},
+					{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded_image}"}},
+				],
+			},
+		],
+		"temperature": 0.3,
+	}
+
+	headers = {
+		"Authorization": f"Bearer {config['api_key']}",
+		"Content-Type": "application/json",
+		"HTTP-Referer": config["site_url"],
+		"X-Title": config["app_name"],
+	}
+
+	response = requests.post(
+		f"{config['base_url']}/chat/completions",
+		headers=headers,
+		json=payload,
+		timeout=60,
+	)
+	if response.status_code >= 400:
+		return "Unknown"
+	
+	response_json = response.json()
+	choices = response_json.get("choices") or []
+	if not choices:
+		return "Unknown"
+	
+	message = choices[0].get("message", {})
+	raw_content = extract_message_text(message)
+	
+	# Clean up the response
+	industry = raw_content.strip().strip('"\'').strip()
+	
+	# Map common variations to standard industry names
+	industry_mapping = {
+		"oil and gas": "Oil & Gas",
+		"oil & gas": "Oil & Gas",
+		"oil/gas": "Oil & Gas",
+		"chemical": "Chemical Processing",
+		"chemical processing": "Chemical Processing",
+		"water": "Water Treatment",
+		"water treatment": "Water Treatment",
+		"wastewater": "Water Treatment",
+		"power": "Power Generation",
+		"power generation": "Power Generation",
+		"pharma": "Pharmaceutical",
+		"pharmaceutical": "Pharmaceutical",
+		"food": "Food & Beverage",
+		"food & beverage": "Food & Beverage",
+		"food and beverage": "Food & Beverage",
+		"manufacturing": "Manufacturing",
+	}
+	
+	industry_lower = industry.lower()
+	for key, value in industry_mapping.items():
+		if key in industry_lower:
+			return value
+	
+	return industry if industry else "Unknown"
 
 
 def call_openrouter_model(
@@ -556,6 +681,15 @@ async def detect_components(file: UploadFile = File(...)) -> DetectionResponse:
 		raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 	config = get_openrouter_config()
+	
+	# Detect industry from the first page
+	industry = None
+	if frames:
+		try:
+			industry = await asyncio.to_thread(detect_industry, frames[0], config)
+		except Exception:  # noqa: BLE001
+			industry = "Unknown"
+	
 	return DetectionResponse(
 		filename=file.filename or "uploaded-file",
 		content_type=file.content_type,
@@ -563,4 +697,29 @@ async def detect_components(file: UploadFile = File(...)) -> DetectionResponse:
 		page_count=len(frames),
 		models_used=[f"{config['qwen_model']} (detection)", f"{config['claude_model']} (verification)"],
 		pages=pages,
+		industry=industry,
 	)
+
+
+@app.post("/coordinates", response_model=CoordinateDetectionResponse)
+async def detect_component_coordinates(file: UploadFile = File(...)) -> CoordinateDetectionResponse:
+	file_bytes = await file.read()
+	if not file_bytes:
+		raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+	try:
+		frames, source_type = load_image_frames(file_bytes, file.filename, file.content_type)
+	except ValueError as exc:
+		raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+	config = get_openrouter_config()
+	
+	# Detect coordinates from the first page
+	try:
+		coordinates = await asyncio.to_thread(detect_coordinates, frames[0], config)
+	except HTTPException:
+		raise
+	except Exception as exc:  # noqa: BLE001
+		raise HTTPException(status_code=502, detail=str(exc)) from exc
+	
+	return CoordinateDetectionResponse(**coordinates)
