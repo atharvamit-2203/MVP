@@ -120,6 +120,7 @@ type DetectionResponse = {
   models_used: string[]
   pages: PageDetectionResult[]
   industry: string | null
+  industry_warnings: { component: string[]; pid: string[] }
 }
 
 type BatchAnalysisItem = {
@@ -181,6 +182,42 @@ type BatchRun = {
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
 
+// List of industries that use P&ID diagrams
+const INDUSTRIES = [
+  'Oil and Gas (Upstream, midstream, and downstream refining)',
+  'Petrochemical (Plastics, synthetic fibers, and rubber production)',
+  'Chemical Manufacturing (Specialty, bulk, and agrochemicals)',
+  'Power Generation (Nuclear, fossil fuel, hydroelectric, and geothermal)',
+  'Mining and Metallurgy (Mineral processing and metal refining)',
+  'Life Sciences & Consumer Goods',
+  'Pharmaceutical (Drug manufacturing and active ingredient processing)',
+  'Biotechnology (Vaccines and bio-engineered products)',
+  'Food and Beverage (Breweries, dairy processing, and packaged foods)',
+  'Cosmetics (Personal care products and fragrance manufacturing)',
+  'Utilities & Infrastructure',
+  'Water and Wastewater Treatment (Municipal and industrial purification)',
+  'HVAC and Refrigeration (Large-scale commercial and industrial cooling)',
+  'Pulp and Paper (Wood processing and paper manufacturing)',
+  'Semiconductor Manufacturing (Ultra-pure water and chemical delivery systems)'
+]
+
+type ComponentUpload = {
+  file: File
+  name: string
+  previewUrl: string
+  verified: boolean
+  verificationStatus: 'idle' | 'pending' | 'verified' | 'mismatch' | 'error'
+  verificationMessage: string
+  detectedIndustry: string | null
+}
+
+type BatchComponentVerificationResult = {
+  name: string
+  matches: boolean
+  detected_industry: string | null
+  message: string
+}
+
 function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
@@ -193,6 +230,9 @@ function App() {
   const [selectedPreviewUrl, setSelectedPreviewUrl] = useState<string | null>(null)
   const [batchRuns, setBatchRuns] = useState<BatchRun[]>([])
   const [activeTab, setActiveTab] = useState<'upload' | 'results' | 'coordinates'>('upload')
+  const [selectedIndustry, setSelectedIndustry] = useState<string>('')
+  const [componentUploads, setComponentUploads] = useState<ComponentUpload[]>([])
+  const [industryWarnings, setIndustryWarnings] = useState<{ component: string[]; pid: string[] }>({ component: [], pid: [] })
 
   const currentFile = selectedFiles[0] ?? null
 
@@ -236,6 +276,168 @@ function App() {
     }
   }
 
+  const handleComponentUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? [])
+    const newComponents: ComponentUpload[] = files.map(file => ({
+      file,
+      name: '',
+      previewUrl: URL.createObjectURL(file),
+      verified: false,
+      verificationStatus: 'idle',
+      verificationMessage: '',
+      detectedIndustry: null
+    }))
+    setComponentUploads([...componentUploads, ...newComponents])
+  }
+
+  const handleComponentNameChange = (index: number, name: string) => {
+    const updated = [...componentUploads]
+    updated[index].name = name
+    updated[index].verificationStatus = 'idle'
+    updated[index].verified = false
+    updated[index].verificationMessage = ''
+    updated[index].detectedIndustry = null
+    setComponentUploads(updated)
+  }
+
+  const updateComponentVerification = (
+    index: number,
+    patch: Partial<Pick<ComponentUpload, 'verified' | 'verificationStatus' | 'verificationMessage' | 'detectedIndustry'>>
+  ) => {
+    setComponentUploads((previous) => {
+      if (!previous[index]) {
+        return previous
+      }
+
+      const updated = [...previous]
+      updated[index] = { ...updated[index], ...patch }
+      return updated
+    })
+  }
+
+  const verifyComponentIndustry = async (index: number) => {
+    const component = componentUploads[index]
+    if (!selectedIndustry || !component?.name) {
+      return
+    }
+
+    updateComponentVerification(index, {
+      verificationStatus: 'pending',
+      verificationMessage: '',
+      detectedIndustry: null,
+      verified: false,
+    })
+
+    try {
+      const base64 = await fileToBase64(component.file)
+      
+      const response = await fetch(`${API_BASE_URL}/verify_component_industry`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: component.name,
+          file_data: base64,
+          industry: selectedIndustry,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Verification failed')
+      }
+
+      const result = await response.json()
+      
+      updateComponentVerification(index, {
+        verified: result.matches,
+        verificationStatus: result.matches ? 'verified' : 'mismatch',
+        verificationMessage: result.message ?? '',
+        detectedIndustry: result.detected_industry ?? null,
+      })
+    } catch (error) {
+      updateComponentVerification(index, {
+        verificationStatus: 'error',
+        verificationMessage: error instanceof Error ? error.message : 'Verification failed.',
+      })
+    }
+  }
+
+  const verifyAllComponentIndustries = async () => {
+    const componentsToVerify = componentUploads.filter(
+      (component) => Boolean(selectedIndustry && component.name && component.verificationStatus !== 'pending')
+    )
+
+    if (!selectedIndustry || componentsToVerify.length === 0) {
+      return
+    }
+
+    componentUploads.forEach((component, index) => {
+      if (component.name) {
+        updateComponentVerification(index, {
+          verificationStatus: 'pending',
+          verificationMessage: '',
+          detectedIndustry: null,
+          verified: false,
+        })
+      }
+    })
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/verify_component_industries`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          industry: selectedIndustry,
+          components: componentsToVerify.map((component) => ({
+            name: component.name,
+          })),
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Batch verification failed')
+      }
+
+      const payload: { results: BatchComponentVerificationResult[] } = await response.json()
+      const resultsByName = new Map(payload.results.map((result) => [result.name, result]))
+
+      componentsToVerify.forEach((component) => {
+        const index = componentUploads.findIndex((item) => item === component)
+        const result = resultsByName.get(component.name)
+        if (index === -1 || !result) {
+          return
+        }
+
+        updateComponentVerification(index, {
+          verified: result.matches,
+          verificationStatus: result.matches ? 'verified' : 'mismatch',
+          verificationMessage: result.message ?? '',
+          detectedIndustry: result.detected_industry ?? null,
+        })
+      })
+    } catch (error) {
+      componentsToVerify.forEach((component) => {
+        const index = componentUploads.findIndex((item) => item === component)
+        if (index === -1) {
+          return
+        }
+
+        updateComponentVerification(index, {
+          verificationStatus: 'error',
+          verificationMessage: error instanceof Error ? error.message : 'Batch verification failed.',
+        })
+      })
+    }
+  }
+
+  const removeComponent = (index: number) => {
+    const updated = componentUploads.filter((_, i) => i !== index)
+    setComponentUploads(updated)
+  }
+
   const handleFilesSelect = (files: File[]) => {
     setSelectedFiles(files)
     setError(null)
@@ -244,6 +446,125 @@ function App() {
     setCoordinates(null)
     setBatchRuns([])
     setActiveTab('upload')
+  }
+
+  const postFileWithIndustry = async (endpoint: string, file: File, industry: string, components: ComponentUpload[]) => {
+    if (!file) {
+      throw new Error('Choose an image or PDF first.')
+    }
+
+    const formData = new FormData()
+    formData.append('file', file)
+    if (industry) {
+      formData.append('industry', industry)
+    }
+    if (components.length > 0) {
+      const componentsData = await Promise.all(
+        components.map(async (comp) => {
+          const base64 = await fileToBase64(comp.file, { maxDimension: 640, quality: 0.8 })
+          return { name: comp.name, file_data: base64 }
+        })
+      )
+      formData.append('components_json', JSON.stringify(componentsData))
+    }
+
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      method: 'POST',
+      body: formData,
+    })
+
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as { detail?: string } | null
+      throw new Error(payload?.detail ?? `Request failed with status ${response.status}`)
+    }
+
+    return response.json()
+  }
+
+  const analyzeFast = async (file: File, industry: string, components: ComponentUpload[]) => {
+    if (!file) {
+      throw new Error('Choose an image or PDF first.')
+    }
+
+    const formData = new FormData()
+    formData.append('file', file)
+    if (industry) {
+      formData.append('industry', industry)
+    }
+    if (components.length > 0) {
+      const componentsData = await Promise.all(
+        components.map(async (comp) => {
+          const base64 = await fileToBase64(comp.file, { maxDimension: 640, quality: 0.8 })
+          return { name: comp.name, file_data: base64 }
+        })
+      )
+      formData.append('components_json', JSON.stringify(componentsData))
+    }
+
+    const response = await fetch(`${API_BASE_URL}/analyze_fast`, {
+      method: 'POST',
+      body: formData,
+    })
+
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as { detail?: string } | null
+      throw new Error(payload?.detail ?? `Request failed with status ${response.status}`)
+    }
+
+    return response.json()
+  }
+
+  const fileToBase64 = (file: File, options?: { maxDimension?: number; quality?: number }): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.readAsDataURL(file)
+      reader.onload = () => {
+        const result = reader.result as string
+
+        const maxDimension = options?.maxDimension
+        const quality = options?.quality ?? 0.85
+        const shouldResize = Boolean(maxDimension && file.type.startsWith('image/'))
+
+        if (!shouldResize) {
+          const base64 = result.split(',')[1]
+          resolve(base64)
+          return
+        }
+
+        const image = new Image()
+        image.onload = () => {
+          const currentMax = Math.max(image.width, image.height)
+          if (!maxDimension || currentMax <= maxDimension) {
+            const base64 = result.split(',')[1]
+            resolve(base64)
+            return
+          }
+
+          const scale = maxDimension / currentMax
+          const width = Math.max(1, Math.round(image.width * scale))
+          const height = Math.max(1, Math.round(image.height * scale))
+          const canvas = document.createElement('canvas')
+          canvas.width = width
+          canvas.height = height
+          const ctx = canvas.getContext('2d')
+          if (!ctx) {
+            const base64 = result.split(',')[1]
+            resolve(base64)
+            return
+          }
+
+          ctx.drawImage(image, 0, 0, width, height)
+          const resized = canvas.toDataURL('image/jpeg', quality)
+          resolve(resized.split(',')[1])
+        }
+        image.onerror = () => {
+          const base64 = result.split(',')[1]
+          resolve(base64)
+        }
+        image.src = result
+      }
+      reader.onerror = reject
+    })
   }
 
   const postFile = async (endpoint: string, file: File) => {
@@ -295,20 +616,33 @@ function App() {
       return
     }
 
+    if (!selectedIndustry) {
+      setError('Please select your industry first.')
+      return
+    }
+
     setIsUploading(true)
     setError(null)
+    setIndustryWarnings({ component: [], pid: [] })
     try {
       const runs: BatchRun[] = []
 
       if (selectedFiles.length === 1) {
         const file = selectedFiles[0]
         try {
-          const uploadPayload = (await postFile('/upload', file)) as Stage1Response
-          const detectionPayload = (await postFile('/detect', file)) as DetectionResponse
-          const coordinatesPayload = sanitizeCoordinates((await postFile('/coordinates', file)) as CoordinateDetectionResponse)
+          // Use the fast endpoint that runs detection and coordinates in parallel
+          const fastAnalysis = await analyzeFast(file, selectedIndustry, componentUploads)
+          const detectionPayload = fastAnalysis.detection as DetectionResponse
+          const coordinatesPayload = sanitizeCoordinates(fastAnalysis.coordinates as CoordinateDetectionResponse)
+          
+          // Set industry warnings from detection response
+          if (detectionPayload.industry_warnings) {
+            setIndustryWarnings(detectionPayload.industry_warnings)
+          }
+          
           runs.push({
             file,
-            result: uploadPayload,
+            result: null,
             detection: detectionPayload,
             coordinates: coordinatesPayload,
             error: null,
@@ -338,11 +672,13 @@ function App() {
       }
 
       setBatchRuns(runs)
-      const firstSuccess = runs.find((run) => run.result && run.detection && run.coordinates) ?? null
+      const firstSuccess = runs.find((run) => run.detection && run.coordinates) ?? null
       setResult(firstSuccess?.result ?? null)
       setDetection(firstSuccess?.detection ?? null)
       setCoordinates(firstSuccess?.coordinates ?? null)
-      setActiveTab('coordinates')
+      if (firstSuccess) {
+        setActiveTab('coordinates')
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Run All failed.')
     } finally {
@@ -485,12 +821,113 @@ function App() {
             <>
               <section className="hero-panel compact-hero">
                 <p className="lede">
-                  Drop a P&ID image or PDF, send it to the backend, and inspect the loaded
-                  frames before detection starts.
+                  Select your industry, upload component reference photos, then upload your P&ID diagram for AI-powered analysis.
                 </p>
               </section>
 
               <section className="workspace">
+                {/* Industry Selection */}
+                <div className="upload-card">
+                  <div className="upload-copy">
+                    <div className="pill">Industry</div>
+                    <h2>Select Your Industry</h2>
+                    <p>Choose the industry you belong to for accurate component detection and validation.</p>
+                  </div>
+                  <div className="upload-controls">
+                    <select
+                      className="industry-select"
+                      value={selectedIndustry}
+                      onChange={(e) => setSelectedIndustry(e.target.value)}
+                    >
+                      <option value="">Select an industry...</option>
+                      {INDUSTRIES.map(industry => (
+                        <option key={industry} value={industry}>{industry}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Component Upload Section */}
+                <div className="upload-card">
+                  <div className="upload-copy">
+                    <div className="pill">Components</div>
+                    <h2>Upload Component Photos</h2>
+                    <p>Upload reference photos of components (tanks, pumps, motors, valves, etc.) and label each one.</p>
+                  </div>
+                  <div className="upload-controls">
+                    <input
+                      className="file-input"
+                      type="file"
+                      multiple
+                      accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff"
+                      onChange={handleComponentUpload}
+                    />
+                    <button type="button" className="secondary-button browse-button" onClick={() => (document.querySelector('.file-input') as HTMLInputElement)?.click()}>
+                      <span className="button-content">
+                        <FileIcon />
+                        Add Components
+                      </span>
+                    </button>
+                  </div>
+                  {componentUploads.length > 1 && (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => verifyAllComponentIndustries()}
+                      disabled={!selectedIndustry || componentUploads.every((component) => !component.name || component.verificationStatus === 'pending')}
+                      style={{ marginTop: '12px', width: '100%' }}
+                    >
+                      Verify All Components
+                    </button>
+                  )}
+                  
+                  {componentUploads.length > 0 && (
+                    <div className="component-list">
+                      {componentUploads.map((comp, index) => (
+                        <div key={index} className="component-item">
+                          <img src={comp.previewUrl} alt={comp.name || 'Component'} className="component-preview" />
+                          <input
+                            type="text"
+                            className="component-name-input"
+                            placeholder="Enter component name(s), comma separated..."
+                            value={comp.name}
+                            onChange={(e) => handleComponentNameChange(index, e.target.value)}
+                          />
+                          <div className="component-actions">
+                            <button
+                              type="button"
+                              className="verify-button"
+                              onClick={() => verifyComponentIndustry(index)}
+                              disabled={!comp.name || comp.verificationStatus === 'pending'}
+                            >
+                              {comp.verificationStatus === 'pending' ? 'Verifying...' : 'Verify Industry'}
+                            </button>
+                            <button type="button" className="remove-button" onClick={() => removeComponent(index)}>
+                              ×
+                            </button>
+                          </div>
+                          {comp.verificationStatus === 'verified' && (
+                            <div className="verification-badge verified">✓ Matches {selectedIndustry}</div>
+                          )}
+                          {comp.verificationStatus === 'mismatch' && (
+                            <div className="verification-badge mismatch">⚠ Industry Mismatch</div>
+                          )}
+                          {comp.verificationStatus === 'error' && (
+                            <div className="verification-badge error">✗ Verification Error</div>
+                          )}
+                          {comp.detectedIndustry && comp.verificationStatus !== 'pending' && (
+                            <div className="verification-message">Detected industry: {comp.detectedIndustry}</div>
+                          )}
+                          {comp.verificationMessage && comp.verificationStatus !== 'pending' && (
+                            <div className="verification-message">{comp.verificationMessage}</div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* P&ID Upload Section */}
                 <div
                   className={`upload-card ${isDragging ? 'dragging' : ''}`}
                   onDragEnter={(event) => {
@@ -562,6 +999,29 @@ function App() {
                       <strong>{selectedFiles.length > 1 ? 'Enabled' : 'Single file'}</strong>
                     </div>
                   </div>
+
+                  {industryWarnings.component.length > 0 && (
+                    <div className="status warning">
+                      <span className="status-icon"><AlertIcon /></span>
+                      <div>
+                        <strong>Industry Mismatch Warning:</strong>
+                        {industryWarnings.component.map((warning, i) => (
+                          <div key={i}>{warning}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {industryWarnings.pid.length > 0 && (
+                    <div className="status warning">
+                      <span className="status-icon"><AlertIcon /></span>
+                      <div>
+                        <strong>P&ID Industry Mismatch:</strong>
+                        {industryWarnings.pid.map((warning, i) => (
+                          <div key={i}>{warning}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   {error ? (
                     <div className="status error">

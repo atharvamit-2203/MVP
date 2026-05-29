@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -10,6 +11,8 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 import joblib
+
+logger = logging.getLogger(__name__)
 
 if __package__:
     from .local_detection import detect_shape_components, bbox_area, bbox_center
@@ -72,7 +75,8 @@ def _extract_features_from_box(image_array: np.ndarray, bbox: Tuple[int, int, in
     if roi.size == 0:
         roi = image_array
     gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    # Reduced bilateral filter parameters for faster processing
+    gray = cv2.bilateralFilter(gray, 5, 50, 50)
     blurred_full = cv2.GaussianBlur(gray, (3, 3), 0)
     thresh_full = cv2.adaptiveThreshold(
         blurred_full, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 41, 10
@@ -87,6 +91,28 @@ def _extract_features_from_box(image_array: np.ndarray, bbox: Tuple[int, int, in
     edges = cv2.Canny(resized, 50, 150)
     edge_density = float(np.count_nonzero(edges) / max(1, edges.size))
     aspect = float(w / max(h, 1))
+    
+    # Additional color-based features for better discrimination
+    if len(image_array.shape) == 3:
+        # Convert ROI to RGB if it's BGR
+        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB) if roi.shape[2] == 3 else roi
+        # Calculate color statistics in different channels
+        mean_r = float(np.mean(roi_rgb[:, :, 0]))
+        mean_g = float(np.mean(roi_rgb[:, :, 1]))
+        mean_b = float(np.mean(roi_rgb[:, :, 2]))
+        std_r = float(np.std(roi_rgb[:, :, 0]))
+        std_g = float(np.std(roi_rgb[:, :, 1]))
+        std_b = float(np.std(roi_rgb[:, :, 2]))
+        # Add color ratios for better discrimination
+        total_color = mean_r + mean_g + mean_b + 1e-10
+        r_ratio = float(mean_r / total_color)
+        g_ratio = float(mean_g / total_color)
+        b_ratio = float(mean_b / total_color)
+    else:
+        mean_r = mean_g = mean_b = mean_int
+        std_r = std_g = std_b = std_int
+        r_ratio = g_ratio = b_ratio = 0.33
+    
     features: Dict[str, Any] = {
         "area": float(max(1, w * h)),
         "aspect": aspect,
@@ -95,6 +121,15 @@ def _extract_features_from_box(image_array: np.ndarray, bbox: Tuple[int, int, in
         "edge_density": edge_density,
         "foreground_ratio": foreground_ratio,
         "vertex_count": int(vertex_count or 0),
+        "mean_r": mean_r,
+        "mean_g": mean_g,
+        "mean_b": mean_b,
+        "std_r": std_r,
+        "std_g": std_g,
+        "std_b": std_b,
+        "r_ratio": r_ratio,
+        "g_ratio": g_ratio,
+        "b_ratio": b_ratio,
     }
 
     if largest is not None:
@@ -123,14 +158,15 @@ def _extract_features_from_box(image_array: np.ndarray, bbox: Tuple[int, int, in
     features["symmetry_lr"] = float(left_right / 255.0)
     features["symmetry_tb"] = float(top_bottom / 255.0)
 
+    # Optimized HOG with smaller block size for faster computation
     hog = cv2.HOGDescriptor(
-        (64, 64),
-        (16, 16),
+        (32, 32),
         (8, 8),
-        (8, 8),
+        (4, 4),
+        (4, 4),
         9,
     )
-    hog_vector = hog.compute(cv2.resize(resized, (64, 64), interpolation=cv2.INTER_AREA)).flatten()
+    hog_vector = hog.compute(cv2.resize(resized, (32, 32), interpolation=cv2.INTER_AREA)).flatten()
     for index, value in enumerate(hog_vector):
         features[f"hog_{index}"] = float(value)
 
@@ -188,11 +224,15 @@ def train_model() -> Dict[str, Any]:
     y_int = y.map(label_to_int)
 
     clf = RandomForestClassifier(
-        n_estimators=300, 
+        n_estimators=600, 
         random_state=42, 
-        class_weight="balanced_subsample",
-        max_depth=5,
-        min_samples_leaf=2
+        class_weight="balanced",
+        max_depth=15,
+        min_samples_leaf=1,
+        min_samples_split=2,
+        max_features="sqrt",
+        bootstrap=True,
+        n_jobs=-1  # Use all cores for faster training
     )
     clf.fit(df.values, y_int.values)
     joblib.dump({"model": clf, "labels": labels, "columns": df.columns.tolist(), "feature_version": 2}, MODEL_PATH)
@@ -231,10 +271,12 @@ def predict_candidates(
     model_blob: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     """Given image and candidate detections (with bbox and vertex_count), return with uncertainty scores."""
-    model_blob = model_blob or load_model_cached()
-    results = []
+    if model_blob is None:
+        model_blob = load_model_cached()
+    
     if model_blob is None:
         # no model: return candidates with uncertainty 1.0
+        results = []
         for c in candidates:
             results.append({**c, "uncertainty": 1.0})
         return results
@@ -250,6 +292,7 @@ def predict_candidates(
         feats_list.append([feats.get(col, 0) for col in cols])
 
     probs = clf.predict_proba(feats_list)
+    results = []
     for c, p in zip(candidates, probs):
         maxp = float(max(p))
         label_idx = int(p.argmax())

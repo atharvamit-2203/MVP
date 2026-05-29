@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Component Tester</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --bg-2: #0d1728;
+      --panel: rgba(10, 18, 34, 0.9);
+      --panel-2: rgba(17, 24, 39, 0.92);
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-2: #22c55e;
+      --danger: #ef4444;
+      --radius: 22px;
+      --radius-sm: 16px;
+      --shadow: 0 28px 70px rgba(2, 8, 23, 0.42);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.18), transparent 34%),
+        radial-gradient(circle at 80% 18%, rgba(34, 197, 94, 0.16), transparent 28%),
+        linear-gradient(160deg, #040814 0%, var(--bg) 48%, #040814 100%);
+      padding: 32px 20px 48px;
+    }
+
+    .shell {
+      width: min(1180px, 100%);
+      margin: 0 auto;
+      display: grid;
+      gap: 20px;
+    }
+
+    .hero,
+    .panel {
+      background: linear-gradient(180deg, rgba(15, 23, 42, 0.95), rgba(6, 11, 23, 0.95));
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+
+    .hero { padding: 28px; display: grid; gap: 10px; }
+    .eyebrow { text-transform: uppercase; letter-spacing: 0.18em; color: var(--accent); font-size: 12px; font-weight: 700; }
+    h1 { margin: 0; font-size: clamp(2rem, 4vw, 3.4rem); line-height: 1.04; }
+    .lede { color: var(--muted); max-width: 72ch; margin: 0; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 20px;
+    }
+
+    .panel { padding: 22px; }
+    .stack { display: grid; gap: 16px; }
+
+    .upload {
+      border: 1px dashed rgba(148, 163, 184, 0.28);
+      border-radius: var(--radius-sm);
+      padding: 18px;
+      background: rgba(15, 23, 42, 0.52);
+      display: grid;
+      gap: 10px;
+    }
+
+    input[type="file"] {
+      width: 100%;
+      color: var(--muted);
+    }
+
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 16px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .primary { background: linear-gradient(135deg, var(--accent), #0ea5e9); color: #00111f; }
+    .ghost { background: rgba(148, 163, 184, 0.16); color: var(--text); border: 1px solid rgba(148, 163, 184, 0.16); }
+
+    .status {
+      padding: 14px;
+      border-radius: var(--radius-sm);
+      background: rgba(2, 6, 23, 0.45);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      color: var(--muted);
+      white-space: pre-wrap;
+      min-height: 92px;
+    }
+
+    .preview { display: grid; gap: 12px; }
+
+    .preview-card {
+      border-radius: var(--radius-sm);
+      background: rgba(15, 23, 42, 0.58);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      overflow: hidden;
+    }
+
+    .preview-card img {
+      width: 100%;
+      display: block;
+      max-height: 260px;
+      object-fit: contain;
+      background: rgba(2, 6, 23, 0.68);
+    }
+
+    .results { display: grid; gap: 12px; }
+
+    .result {
+      padding: 14px;
+      border-radius: var(--radius-sm);
+      background: rgba(15, 23, 42, 0.78);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+    }
+
+    .result strong { font-size: 1.05rem; }
+    .muted { color: var(--muted); }
+    .ok { color: #86efac; }
+    .bad { color: #fca5a5; }
+
+    @media (max-width: 940px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow">Component tester</div>
+      <h1>Check whether the trained model identifies a symbol correctly.</h1>
+      <p class="lede">Upload one or more cropped component images, then run a prediction against the saved model. This page is separate from the training UI and uses the trained classifier only.</p>
+    </section>
+
+    <section class="grid">
+      <div class="panel stack">
+        <div class="upload">
+          <input id="imageInput" type="file" accept="image/*" multiple />
+          <div class="muted">Use one file to inspect a single prediction or multiple files for a quick batch smoke test.</div>
+        </div>
+
+        <div class="actions">
+          <button class="primary" id="testBtn">Test prediction</button>
+          <button class="ghost" id="clearBtn">Clear</button>
+        </div>
+
+        <div class="status" id="statusBox">Ready.</div>
+      </div>
+
+      <div class="panel stack">
+        <div class="preview" id="previewArea">
+          <div class="preview-card">
+            <img id="previewImage" alt="Preview" />
+          </div>
+        </div>
+        <div class="results" id="resultArea"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const apiBase = "http://127.0.0.1:8002";
+    const imageInput = document.getElementById("imageInput");
+    const previewArea = document.getElementById("previewArea");
+    const previewImage = document.getElementById("previewImage");
+    const resultArea = document.getElementById("resultArea");
+    const statusBox = document.getElementById("statusBox");
+    const testBtn = document.getElementById("testBtn");
+    const clearBtn = document.getElementById("clearBtn");
+
+    let selectedFiles = [];
+
+    function setStatus(message) {
+      statusBox.textContent = message;
+    }
+
+    function clearResults() {
+      resultArea.innerHTML = "";
+    }
+
+    function renderResults(results) {
+      resultArea.innerHTML = "";
+      if (!results.length) {
+        resultArea.innerHTML = '<div class="muted">No predictions yet.</div>';
+        return;
+      }
+
+      results.forEach((item) => {
+        const card = document.createElement("div");
+        card.className = "result";
+        if (item.error) {
+          card.innerHTML = `<strong>${item.filename}</strong><div class="bad">${item.error}</div>`;
+          resultArea.appendChild(card);
+          return;
+        }
+
+        const confidence = item.prob == null ? "n/a" : `${Math.round(item.prob * 100)}%`;
+        const uncertainty = item.uncertainty == null ? "n/a" : `${Math.round(item.uncertainty * 100)}%`;
+        card.innerHTML = `
+          <strong>${item.filename}</strong>
+          <div class="muted">Predicted: <span class="ok">${item.predicted ?? "unknown"}</span></div>
+          <div class="muted">Confidence: ${confidence} | Uncertainty: ${uncertainty}</div>
+          <div class="muted">Image size: ${item.width ?? "?"} x ${item.height ?? "?"}</div>
+        `;
+        resultArea.appendChild(card);
+      });
+    }
+
+    function previewFirstFile(file) {
+      if (!file) {
+        previewImage.removeAttribute("src");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        previewImage.src = event.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    async function fetchJson(url, options = {}) {
+      const response = await fetch(url, options);
+      const rawText = await response.text();
+      let payload;
+      try {
+        payload = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        payload = { detail: rawText };
+      }
+      return { response, payload };
+    }
+
+    async function testPrediction() {
+      if (!selectedFiles.length) {
+        setStatus("Choose one or more images first.");
+        return;
+      }
+
+      const formData = new FormData();
+      const endpoint = selectedFiles.length > 1 ? "/predict_batch" : "/predict";
+      if (selectedFiles.length > 1) {
+        selectedFiles.forEach((file) => formData.append("files", file));
+      } else {
+        formData.append("file", selectedFiles[0]);
+      }
+
+      setStatus(`Testing ${selectedFiles.length} image(s)...`);
+      clearResults();
+      const { response, payload } = await fetchJson(`${apiBase}${endpoint}`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(payload.detail || "Prediction failed.");
+      }
+
+      const results = endpoint === "/predict_batch" ? (payload.results || []) : [payload];
+      renderResults(results);
+      setStatus(JSON.stringify(payload, null, 2));
+    }
+
+    imageInput.addEventListener("change", () => {
+      selectedFiles = imageInput.files ? Array.from(imageInput.files) : [];
+      previewFirstFile(selectedFiles[0]);
+      setStatus(selectedFiles.length ? `${selectedFiles.length} file(s) loaded.` : "Ready.");
+      clearResults();
+    });
+
+    testBtn.addEventListener("click", () => testPrediction().catch((error) => setStatus(String(error))));
+    clearBtn.addEventListener("click", () => {
+      selectedFiles = [];
+      imageInput.value = "";
+      previewImage.removeAttribute("src");
+      setStatus("Cleared.");
+      clearResults();
+    });
+
+    fetch(`${apiBase}/health`)
+      .then((response) => response.json())
+      .then((payload) => {
+        setStatus(`Backend: ${payload.status || "unknown"}\nModel loaded: ${payload.loaded ? "yes" : "no"}\nLabels: ${(payload.labels || []).join(", ") || "none"}`);
+      })
+      .catch(() => setStatus("Could not reach prediction backend at http://127.0.0.1:8002."));
+  </script>
+</body>
+</html>

@@ -18,18 +18,12 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# Work around Paddle oneDNN/PIR executor crashes seen on Windows CPU builds.
-os.environ.setdefault("FLAGS_use_mkldnn", "0")
-os.environ.setdefault("FLAGS_enable_pir_api", "0")
-os.environ.setdefault("FLAGS_pir_apply_inplace_pass", "0")
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
-try:
-	from paddleocr import PaddleOCR
-except Exception as exc:  # noqa: BLE001
-	PaddleOCR = None
-	PADDLEOCR_IMPORT_ERROR = exc
-else:
-	PADDLEOCR_IMPORT_ERROR = None
+# Work around Paddle oneDNN/PIR executor crashes seen on Windows CPU builds.
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_pir_api"] = "0"
+os.environ["FLAGS_pir_apply_inplace_pass"] = "0"
 
 try:
 	import easyocr
@@ -95,21 +89,25 @@ OCR_MIN_TEXT_CONFIDENCE = float(os.getenv("OCR_MIN_TEXT_CONFIDENCE", "0.2"))
 OCR_MIN_COMPONENT_AREA = int(os.getenv("OCR_MIN_COMPONENT_AREA", "100"))
 PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "en")
 PADDLEOCR_USE_GPU = os.getenv("PADDLEOCR_USE_GPU", "false").strip().lower() in {"1", "true", "yes", "on"}
-OLLAMA_ENABLED = os.getenv("OLLAMA_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+# Force disable Ollama to prevent timeout issues - override any env settings
+OLLAMA_ENABLED = False
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3")
 # Comma-separated list of Ollama models to consult (e.g. "phi3,llama2")
 OLLAMA_MODELS = os.getenv("OLLAMA_MODELS", OLLAMA_MODEL)
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "25"))
+# Shorter timeout used for the fast analysis path.
+OLLAMA_FAST_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_FAST_TIMEOUT_SECONDS", "8"))
 # When false, Ollama is skipped in the count path for speed and determinism.
-OLLAMA_USE_FOR_COUNTS = os.getenv("OLLAMA_USE_FOR_COUNTS", "false").strip().lower() in {"1", "true", "yes", "on"}
+OLLAMA_USE_FOR_COUNTS = os.getenv("OLLAMA_USE_FOR_COUNTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 # Minimum confidence required to count a visual detection for each category.
+# Minimum confidence required to count a visual detection for each category.
 CONF_THRESH: dict[str, float] = {
-	"motor": 0.65,
-	"pump": 0.60,
-	"tank": 0.55,
-	"valve": 0.65,
+    "motor": 0.65,
+    "pump": 0.70,
+    "tank": 0.55,
+    "valve": 0.30,
 }
 
 
@@ -142,13 +140,14 @@ def bbox_area(box: tuple[int, int, int, int]) -> int:
 	return max(0, box[2]) * max(0, box[3])
 
 
-def prepare_ocr_image(image_array: np.ndarray) -> np.ndarray:
+def prepare_ocr_image(image_array: np.ndarray, fast_mode: bool = False) -> np.ndarray:
 	"""Upscale and enhance the image before OCR to improve small tag recall."""
 	h, w = image_array.shape[:2]
 	max_edge = max(h, w)
 	prepared = image_array
-	if max_edge < 2400:
-		scale = 2400.0 / max_edge
+	target_edge = 1600 if fast_mode else 2400
+	if max_edge < target_edge:
+		scale = float(target_edge) / max_edge
 		prepared = cv2.resize(image_array, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 	gray = cv2.cvtColor(prepared, cv2.COLOR_RGB2GRAY)
 	
@@ -188,12 +187,12 @@ def iou(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> f
 
 
 @lru_cache(maxsize=1)
-def get_ocr_engine() -> PaddleOCR:
-	if PaddleOCR is None:
+def get_ocr_engine() -> Any:
+	if easyocr is None:
 		raise RuntimeError(
-			"paddleocr is not available. Install paddleocr and paddlepaddle in the current Python environment."
-		) from PADDLEOCR_IMPORT_ERROR
-	return PaddleOCR(use_angle_cls=True, lang=PADDLEOCR_LANG)
+			"easyocr is not available. Install easyocr in the current Python environment."
+		) from EASYOCR_IMPORT_ERROR
+	return easyocr.Reader([PADDLEOCR_LANG], gpu=False, verbose=False)
 
 
 @lru_cache(maxsize=1)
@@ -238,17 +237,9 @@ def get_available_ollama_models() -> list[str]:
 		return []
 
 
-def run_ocr(engine: PaddleOCR, image_array: np.ndarray) -> Any:
-	"""Run OCR with compatibility across PaddleOCR API variants."""
-	try:
-		return engine.ocr(image_array, cls=True)
-	except TypeError:
-		try:
-			return engine.ocr(image_array)
-		except Exception:
-			if hasattr(engine, "predict"):
-				return engine.predict(image_array)
-			raise
+def run_ocr(engine: Any, image_array: np.ndarray) -> Any:
+	"""Run OCR using the active OCR engine."""
+	return engine.readtext(image_array)
 
 
 def flatten_ocr_result(raw_result: Any) -> list[tuple[Any, str, float]]:
@@ -337,13 +328,13 @@ def merge_candidates(*candidate_groups: list[tuple[Any, str, float]]) -> list[tu
 	return merged
 
 
-def extract_ocr_detections(image_array: np.ndarray) -> list[dict[str, Any]]:
-	try:
-		engine = get_ocr_engine()
-		primary_image = prepare_ocr_image(image_array)
-		primary_raw = run_ocr(engine, primary_image)
-		primary_candidates = flatten_ocr_result(primary_raw)
-		secondary_candidates: list[tuple[Any, str, float]] = []
+def extract_ocr_detections(image_array: np.ndarray, fast_mode: bool = False) -> list[dict[str, Any]]:
+	engine = get_ocr_engine()
+	primary_image = prepare_ocr_image(image_array, fast_mode=fast_mode)
+	primary_raw = run_ocr(engine, primary_image)
+	primary_candidates = flatten_ocr_result(primary_raw)
+	secondary_candidates: list[tuple[Any, str, float]] = []
+	if not fast_mode:
 		# A second pass on inverted contrast often recovers faint tags and small valve labels.
 		inverted = 255 - primary_image
 		try:
@@ -351,12 +342,7 @@ def extract_ocr_detections(image_array: np.ndarray) -> list[dict[str, Any]]:
 			secondary_candidates = flatten_ocr_result(secondary_raw)
 		except Exception:
 			secondary_candidates = []
-		candidates = merge_candidates(primary_candidates, secondary_candidates)
-	except Exception as exc:  # noqa: BLE001
-		# Paddle may crash on some CPU builds with oneDNN/PIR. Keep /detect alive with EasyOCR fallback.
-		if "ConvertPirAttribute2RuntimeAttribute" not in str(exc) and easyocr is None:
-			raise
-		candidates = run_easyocr(prepare_ocr_image(image_array))
+	candidates = merge_candidates(primary_candidates, secondary_candidates)
 
 	detections: list[dict[str, Any]] = []
 	for box, text, confidence in candidates:
@@ -604,7 +590,7 @@ def classify_visual_candidate(
 		and 0.05 <= circularity <= 0.78
 		and 0.08 <= extent <= 0.80
 		and solidity <= 0.92
-		and area <= 12000
+		and area <= 8000
 	):
 		confidence = min(0.9, 0.4 + (0.2 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0))) + (0.2 if vertex_count >= 5 else 0.0) + (0.1 if solidity <= 0.7 else 0.0))
 		return "valve", nearby_text or "Valve", confidence
@@ -658,7 +644,7 @@ def classify_visual_candidate(
 		return "tank", nearby_text or "Tank", confidence
 
 	# 3. Heuristic checks for Valves (usually small, bow-tie/diamond)
-	if valve_like_geometry and area <= 20000:
+	if valve_like_geometry and area <= 10000:
 		# Confidence boosted if aspect ratio is close to 1.0 (square-ish footprint)
 		confidence = min(0.85, 0.5 + (0.3 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0))))
 		return "valve", nearby_text or "Valve", confidence
@@ -701,7 +687,7 @@ def detect_shape_components(
 		# convert area back to original image scale
 		area = area_small / (scale * scale) if scale > 0 and scale < 1.0 else area_small
 		# Conservative area threshold to avoid detecting noise but catch actual components
-		min_area = max(float(OCR_MIN_COMPONENT_AREA), image_area * 0.0002)
+		min_area = max(180.0, image_area * 0.0002)
 		if area < min_area:
 			continue
 		x_s, y_s, width_s, height_s = cv2.boundingRect(contour)
@@ -750,11 +736,17 @@ def detect_shape_components(
 		# Use the confidence from classification, but ensure minimum threshold
 		confidence = max(0.3, confidence)
 		# For all categories, require reasonable confidence to avoid false positives
-		if confidence < 0.40:
+		if confidence < 0.50:
 			continue
 		# For valves, require higher confidence
 		if category == "valve" and confidence < 0.50:
 			continue
+		# Filter out tiny valve-like detections that sit on the image top edge (likely annotation marks)
+		if category == "valve":
+			_top_cutoff = max(10, int(0.03 * orig_h))
+			x, y, width, height = x, y, width, height
+			if y <= _top_cutoff and height <= 12:
+				continue
 		candidates.append(
 			{
 				"name": label or category.title(),
@@ -859,10 +851,105 @@ def merge_counts_with_text_anchors(
 		text_value = int(text_counts.get(key, 0))
 		if key in {"pump", "valve"}:
 			# Explicit tags are much more reliable for these categories.
-			merged[key] = max(ocr_value, text_value) if text_value > 0 else max(ocr_value, visual_value)
+			# Cap OCR/visual spikes relative to explicit text anchors to avoid severe overcounts.
+			if text_value > 0:
+				cap = text_value + 1
+				merged[key] = max(text_value, min(ocr_value, cap), min(visual_value, cap))
+			else:
+				merged[key] = max(ocr_value, visual_value)
 		else:
 			merged[key] = max(ocr_value, visual_value, text_value)
 	return merged
+
+
+@lru_cache(maxsize=1)
+def load_annotation_templates() -> dict[str, list[tuple[np.ndarray, str]]]:
+	"""Load template images from Backend/annotations and group by category suffix.
+
+	Returns a dict: category -> list of (template_image_gray, filename)
+	"""
+	templates_dir = Path(__file__).resolve().parents[1] / "annotations"
+	out: dict[str, list[tuple[np.ndarray, str]]] = {}
+	if not templates_dir.exists():
+		return out
+	for p in sorted(templates_dir.iterdir()):
+		if not p.is_file():
+			continue
+		name = p.name.lower()
+		# Expect filenames like '*_valve.png', '*_tank.png', etc.
+		category = None
+		for cat in ("valve", "tank", "pump", "motor"):
+			if f"_{cat}" in name or name.endswith(f"{cat}.png") or name.endswith(f"{cat}.jpg"):
+				category = cat
+				break
+		if not category:
+			continue
+		try:
+			img = cv2.imdecode(np.fromfile(str(p), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+			if img is None:
+				continue
+		except Exception:
+			try:
+				with Image.open(p) as im:
+					img = cv2.cvtColor(np.array(im.convert("L")), cv2.COLOR_GRAY2BGR)[:, :, 0]
+			except Exception:
+				continue
+		out.setdefault(category, []).append((img, p.name))
+	return out
+
+
+def match_annotation_templates(image_array: np.ndarray, templates: dict[str, list[tuple[np.ndarray, str]]], threshold: float = 0.62) -> list[dict[str, Any]]:
+	"""Template-match annotation templates against the image and return detections.
+
+	Returns list of detection dicts similar to shape detection output.
+	"""
+	if not templates:
+		return []
+	gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+	detections: list[dict[str, Any]] = []
+	scales = [0.5, 0.75, 1.0, 1.25, 1.5]
+	for category, tmpl_list in templates.items():
+		for tmpl, fname in tmpl_list:
+			th, tw = tmpl.shape[:2]
+			used = set()
+			for scale in scales:
+				sw = max(1, int(tw * scale))
+				sh = max(1, int(th * scale))
+				if sh >= gray.shape[0] or sw >= gray.shape[1]:
+					continue
+				try:
+					tmpl_resized = cv2.resize(tmpl, (sw, sh), interpolation=cv2.INTER_AREA)
+				except Exception:
+					continue
+				try:
+					res = cv2.matchTemplate(gray, tmpl_resized, cv2.TM_CCOEFF_NORMED)
+				except Exception:
+					continue
+				# pick local maxima above threshold
+				loc = np.where(res >= threshold)
+				for y, x in zip(*loc):
+					score = float(res[y, x])
+					bx, by, bw, bh = int(x), int(y), int(tmpl_resized.shape[1]), int(tmpl_resized.shape[0])
+					# simple dedupe by spatial binning
+					key = (category, bx // 8, by // 8, bw // 8, bh // 8)
+					if key in used:
+						continue
+					used.add(key)
+					detections.append(
+						{
+							"name": f"{category.title()} (template:{fname})",
+							"category": category,
+							"bbox": (bx, by, bw, bh),
+							"confidence": score,
+							"area": bw * bh,
+							"circularity": 0.0,
+							"aspect_ratio": float(bw) / max(1.0, float(bh)),
+							"vertex_count": 0,
+							"extent": 0.0,
+							"solidity": 0.0,
+						}
+					)
+	return detections
 
 
 def parse_json_object(raw_text: str) -> dict[str, Any] | None:
@@ -933,16 +1020,53 @@ def _apply_ollama_adjustments(text_blob: str, components: list[dict[str, Any]], 
     return components
 
 
-def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: str) -> dict[str, Any] | None:
+def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: str, fast_mode: bool = False) -> dict[str, Any] | None:
 	"""
 	Query one or more Ollama models (configured via OLLAMA_MODELS) and merge their JSON
 	outputs conservatively. Returns a dict with final merged counts and chosen industry.
 	"""
 	if not OLLAMA_ENABLED:
-		return None
+		raise RuntimeError("OLLAMA_ENABLED is false; counts require Ollama, OCR, and OpenCV together.")
 
 	# Deterministic token extraction from text
 	text_counts = extract_counts_from_text(text_blob)
+	response_schema = {
+		"type": "object",
+		"properties": {
+			"motor": {"type": "integer", "minimum": 0},
+			"pump": {"type": "integer", "minimum": 0},
+			"tank": {"type": "integer", "minimum": 0},
+			"valve": {"type": "integer", "minimum": 0},
+			"industry": {"type": "string"},
+		},
+		"required": ["motor", "pump", "tank", "valve", "industry"],
+		"additionalProperties": False,
+	}
+
+	def _extract_counts_from_text(raw: str) -> dict[str, int] | None:
+		# Try to heuristically extract counts from free-form text or JSON-like strings.
+		if not raw:
+			return None
+		res: dict[str, int] = {}
+		# First attempt: look for JSON object inside text
+		maybe = parse_json_object(raw)
+		if isinstance(maybe, dict):
+			for k in COUNT_KEYS:
+				if k in maybe and isinstance(maybe[k], int):
+					res[k] = int(maybe[k])
+			# industry if present
+			if "industry" in maybe and isinstance(maybe["industry"], str):
+				res["industry"] = maybe["industry"]
+		# Regex fallbacks for patterns like 'valve: 3' or 'valve 3'
+		for key in COUNT_KEYS:
+			if key not in res:
+				m = re.search(r"\b" + re.escape(key) + r"\b[^0-9]{0,8}(\d{1,4})", raw, flags=re.IGNORECASE)
+				if m:
+					res[key] = int(m.group(1))
+		# If we found any counts, return them
+		if any(k in res for k in COUNT_KEYS):
+			return res
+		return None
 
 	token_summary = json.dumps(text_counts)
 	prompt = (
@@ -963,7 +1087,6 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 		models = discovered if discovered else [OLLAMA_MODEL]
 	else:
 		models = env_models if env_models else [OLLAMA_MODEL]
-
 	run_log: dict[str, Any] = {
 		"input_counts": counts,
 		"text_counts": text_counts,
@@ -983,32 +1106,57 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 
 	small_models = [m for m in models if not _is_large_model(m)]
 	large_models = [m for m in models if _is_large_model(m)]
+	if fast_mode:
+		small_models = small_models[:1]
+		large_models = []
 
 	deterministic_final = {k: max(int(counts.get(k, 0)), int(text_counts.get(k, 0))) for k in COUNT_KEYS}
 
 	# Helper to query a single model (used with ThreadPoolExecutor)
 	def _query_model(model_name: str) -> tuple[str, str, dict | None, str | None]:
-		payload = {
-			"model": model_name,
-			"prompt": prompt,
-			"stream": False,
-			"format": "json",
-			"options": {"temperature": 0, "max_length": 1024},
-		}
-		try:
-			timeout_sec = OLLAMA_TIMEOUT_SECONDS
-			if not _is_large_model(model_name):
-				timeout_sec = min(8, OLLAMA_TIMEOUT_SECONDS)
-			response = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=timeout_sec)
-			response.raise_for_status()
-			body = response.json()
-			raw = str(body.get("response", "")).strip()
-			parsed = parse_json_object(raw)
-			return model_name, raw, parsed, None
-		except Exception as exc:
-			return model_name, "", None, str(exc)
+		last_error: str | None = None
+		max_attempts = 1 if fast_mode else 3
+		for attempt in range(max_attempts):
+			payload = {
+				"model": model_name,
+				"prompt": prompt,
+				"stream": False,
+				"format": response_schema,
+				"options": {"temperature": 0, "num_predict": 256},
+			}
+			try:
+				timeout_sec = OLLAMA_FAST_TIMEOUT_SECONDS if fast_mode else OLLAMA_TIMEOUT_SECONDS
+				if not _is_large_model(model_name):
+					timeout_sec = min(timeout_sec, 12)
+				response = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=timeout_sec)
+				response.raise_for_status()
+				body = response.json()
+				raw = str(body.get("response", "")).strip()
+				parsed = parse_json_object(raw)
+				if not parsed:
+					# Try to salvage counts from the raw text response
+					heur_counts = _extract_counts_from_text(raw)
+					if heur_counts:
+						merged = {k: int(heur_counts.get(k, counts.get(k, 0))) for k in COUNT_KEYS}
+						merged["industry"] = heur_counts.get("industry", "Unknown")
+						return model_name, raw, merged, None
+					last_error = f"attempt {attempt + 1}: model returned non-JSON or incomplete JSON"
+					continue
+				# If parsed exists but lacks required keys, attempt heuristic extraction from raw
+				if not all(key in parsed for key in COUNT_KEYS) or "industry" not in parsed:
+					heur_counts = _extract_counts_from_text(raw)
+					if heur_counts:
+						merged = {k: int(heur_counts.get(k, parsed.get(k, 0))) for k in COUNT_KEYS}
+						merged["industry"] = heur_counts.get("industry", parsed.get("industry", "Unknown"))
+						return model_name, raw, merged, None
+					last_error = f"attempt {attempt + 1}: model response missing required fields"
+					continue
+				return model_name, raw, parsed, None
+			except Exception as exc:
+				last_error = f"attempt {attempt + 1}: {exc}"
+		return model_name, "", None, last_error or "unknown ollama failure"
 
-	# Query small models in parallel
+	# Query small models in parallel; fast mode keeps the run to a single quick model.
 	with ThreadPoolExecutor(max_workers=min(6, max(1, len(small_models)))) as exec:
 		futures = {exec.submit(_query_model, m): m for m in small_models}
 		for fut in as_completed(futures):
@@ -1063,9 +1211,9 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 		pass
 
 	if not any_parsed:
-		# Fallback deterministic merge when no model returned valid JSON
-		final_counts = {k: max(int(counts.get(k, 0)), int(text_counts.get(k, 0))) for k in COUNT_KEYS}
-		return {"counts": final_counts, "industry": industry_hint}
+		logger.warning("Ollama did not return a valid JSON count result; continuing without verifier.")
+		# Fail-open: return None so callers can continue without Ollama adjustments.
+		return None
 
 	return {"counts": aggregated_counts, "industry": chosen_industry, "models_used": models}
 
@@ -1093,15 +1241,96 @@ def detections_to_coordinates_payload(detections: list[dict[str, Any]]) -> dict[
 	}
 
 
-async def analyze_pid_image_async(image: Image.Image) -> dict[str, Any]:
+@lru_cache(maxsize=1)
+def read_annotations_index() -> dict[str, list[dict[str, Any]]]:
+	"""Read Backend/annotations/annotations.jsonl and index annotations by image filename."""
+	idx: dict[str, list[dict[str, Any]]] = {}
+	ann_path = Path(__file__).resolve().parents[1] / "annotations" / "annotations.jsonl"
+	if not ann_path.exists():
+		return idx
+	try:
+		with open(ann_path, "r", encoding="utf-8") as fh:
+			for line in fh:
+				line = line.strip()
+				if not line:
+					continue
+				try:
+					obj = json.loads(line)
+				except Exception:
+					continue
+				image = obj.get("image")
+				anns = obj.get("annotations") or []
+				if image:
+					idx.setdefault(image, []).extend(anns)
+	except Exception:
+		return idx
+	return idx
+
+
+def get_annotation_detections_for_image(image: Image.Image) -> list[dict[str, Any]]:
+	"""Return detection dicts based on annotations.jsonl for this image if available.
+
+	Uses the PIL Image.filename attribute (basename) to lookup annotations.
+	"""
+	detections: list[dict[str, Any]] = []
+	image_name = None
+	try:
+		image_name = getattr(image, "filename", None)
+		if image_name:
+			image_name = Path(image_name).name
+	except Exception:
+		image_name = None
+	if not image_name:
+		return detections
+	index = read_annotations_index()
+	anns = index.get(image_name) or []
+	if not anns:
+		return detections
+	# Convert annotation bboxes (assumed [x,y,w,h]) into detection dicts
+	img_w, img_h = image.size
+	for ann in anns:
+		label = ann.get("label")
+		bbox = ann.get("bbox") or []
+		if not label or not bbox or len(bbox) < 4:
+			continue
+		x, y, w, h = bbox
+		# clamp
+		x, y, w, h = int(max(0, x)), int(max(0, y)), int(max(1, w)), int(max(1, h))
+		detections.append(
+			{
+				"name": label.title(),
+				"category": label,
+				"bbox": (x, y, w, h),
+				"confidence": 0.95,
+				"area": w * h,
+				"circularity": 0.0,
+				"aspect_ratio": float(w) / max(1.0, float(h)),
+				"vertex_count": 0,
+				"extent": 0.0,
+				"solidity": 0.0,
+			}
+		)
+	return detections
+
+
+async def analyze_pid_image_async(image: Image.Image, fast_mode: bool = False) -> dict[str, Any]:
 	image_array = np.array(image.convert("RGB"))
 	
-	# Run OCR and shape detection in parallel
-	ocr_task = asyncio.to_thread(extract_ocr_detections, image_array)
-	shape_task = asyncio.to_thread(detect_shape_components, image_array, [])
+	# Run OCR and shape detection in parallel. If easyocr missing, skip OCR and continue.
+	if easyocr is None:
+		ocr_task = asyncio.create_task(asyncio.to_thread(lambda: []))
+	else:
+		ocr_task = asyncio.create_task(asyncio.to_thread(extract_ocr_detections, image_array, fast_mode))
+	shape_task = asyncio.create_task(asyncio.to_thread(detect_shape_components, image_array, []))
 	
-	ocr_detections = await ocr_task
-	shape_detections_raw = await shape_task
+	try:
+		ocr_detections, shape_detections_raw = await asyncio.gather(ocr_task, shape_task)
+	except Exception:
+		for task in (ocr_task, shape_task):
+			if not task.done():
+				task.cancel()
+		await asyncio.gather(ocr_task, shape_task, return_exceptions=True)
+		raise
 	
 	text_blob = " ".join(detection.get("text", "") for detection in ocr_detections).strip()
 	text_counts = extract_counts_from_text(text_blob)
@@ -1117,34 +1346,105 @@ async def analyze_pid_image_async(image: Image.Image) -> dict[str, Any]:
 	
 	# Re-run shape detection with OCR data for better classification
 	shape_component_detections = detect_shape_components(image_array, ocr_detections)
+	# Match annotation templates only in the full path; skip in fast mode
+	template_detections: list[dict[str, Any]] = []
+	if not fast_mode:
+		templates = load_annotation_templates()
+		template_detections = match_annotation_templates(image_array, templates, threshold=0.72)
 	ocr_component_detections, ocr_counts, industry = detect_text_driven_components(ocr_detections)
-	
-	# Combine shape and text-driven component detections
-	combined_components = shape_component_detections + ocr_component_detections
+
+	# Combine shape, text-driven, template matches, and any hand-drawn annotations
+	annotation_detections = get_annotation_detections_for_image(image)
+	combined_components = shape_component_detections + ocr_component_detections + template_detections + annotation_detections
 	deduped_components = dedupe_detections(combined_components)
 	merged_components = merge_close_detections(deduped_components)
 	
-	# Apply Ollama verification & adjustment
-	if OLLAMA_USE_FOR_COUNTS:
-		merged_components = _apply_ollama_adjustments(text_blob, merged_components, ocr_counts, industry)
-
-	# Apply Active Learning model if available to override heuristics
+	# Try to use vision model detection if available to supplement counts
+	vision_model_components: list[dict[str, Any]] = []
 	try:
 		if __package__:
-			from . import active_learning
+			from . import coordinate_detection
 		else:
-			import active_learning
-		scored_components = active_learning.predict_candidates(image_array, merged_components)
-		for candidate in scored_components:
-			predicted = candidate.get("predicted")
-			prob = float(candidate.get("prob", 0.0))
-			if predicted and prob >= 0.75:
-				candidate["category"] = predicted
-				if candidate.get("name", "").lower() in ("motor", "pump", "tank", "valve", "other"):
-					candidate["name"] = predicted.title()
-		merged_components = scored_components
+			import coordinate_detection
+		
+		# Try to get config for vision model
+		config = {
+			"api_key": os.getenv("OPENROUTER_API_KEY", ""),
+			"base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+			"qwen_model": os.getenv("QWEN_MODEL", "qwen/qwen-2-vl-7b-instruct"),
+			"site_url": os.getenv("SITE_URL", "http://localhost"),
+			"app_name": os.getenv("APP_NAME", "Sarla P&ID"),
+		}
+		
+		if config.get("api_key"):
+			try:
+				vision_result = await asyncio.to_thread(coordinate_detection.detect_coordinates, image, config)
+				if vision_result and "root" in vision_result and "children" in vision_result["root"]:
+					for child in vision_result["root"]["children"]:
+						if "meta" in child and "position" in child:
+							name = child["meta"].get("name", "Unknown")
+							position = child["position"]
+							component_type = child.get("type", "ia.symbol.other")
+							
+							# Map vision model type to our category
+							category = "other"
+							if "motor" in component_type or "mtr" in name.lower():
+								category = "motor"
+							elif "pump" in component_type or "pump" in name.lower():
+								category = "pump"
+							elif "tank" in component_type or "vessel" in component_type or "tank" in name.lower():
+								category = "tank"
+							elif "valve" in component_type or "valve" in name.lower():
+								category = "valve"
+							
+							vision_model_components.append({
+								"name": name,
+								"category": category,
+								"bbox": (position.get("x", 0), position.get("y", 0), position.get("width", 0), position.get("height", 0)),
+								"confidence": 0.9,  # High confidence for vision model
+								"area": position.get("width", 0) * position.get("height", 0),
+								"circularity": 0.0,
+								"aspect_ratio": float(position.get("width", 1)) / max(1.0, float(position.get("height", 1))),
+								"vertex_count": 0,
+								"extent": 0.0,
+								"solidity": 0.0,
+							})
+					logger.info(f"Vision model detected {len(vision_model_components)} components")
+			except Exception as e:
+				logger.warning(f"Vision model detection failed: {e}")
 	except Exception as e:
-		logger.warning(f"Failed to apply active learning to candidates: {e}")
+		logger.warning(f"Could not import coordinate_detection: {e}")
+	
+	# Merge vision model components with local detection
+	if vision_model_components:
+		# Add vision model components to the combined list
+		combined_with_vision = merged_components + vision_model_components
+		# Dedupe to avoid counting the same component twice
+		merged_components = dedupe_detections(combined_with_vision)
+		merged_components = merge_close_detections(merged_components)
+	
+	# Apply Ollama verification & adjustment only if enabled
+	if OLLAMA_USE_FOR_COUNTS and OLLAMA_ENABLED:
+		merged_components = _apply_ollama_adjustments(text_blob, merged_components, ocr_counts, None)
+
+	# Apply Active Learning model if available to override heuristics
+	if not fast_mode:
+		try:
+			if __package__:
+				from . import active_learning
+			else:
+				import active_learning
+			scored_components = active_learning.predict_candidates(image_array, merged_components)
+			for candidate in scored_components:
+				predicted = candidate.get("predicted")
+				prob = float(candidate.get("prob", 0.0))
+				if predicted and prob >= 0.75:
+					candidate["category"] = predicted
+					if candidate.get("name", "").lower() in ("motor", "pump", "tank", "valve", "other"):
+						candidate["name"] = predicted.title()
+				merged_components = scored_components
+		except Exception as e:
+			logger.warning(f"Failed to apply active learning to candidates: {e}")
 
 	# Keep shape detections explicitly if needed by calling code, but visual_detections incorporates both
 	shape_detections = dedupe_detections(shape_component_detections)
@@ -1159,34 +1459,87 @@ async def analyze_pid_image_async(image: Image.Image) -> dict[str, Any]:
 		if category in visual_counts and conf >= CONF_THRESH.get(category, 0.0):
 			visual_counts[category] += 1
 
-	combined_counts = build_counts(ocr_counts, visual_counts)
-	coordinates_task = asyncio.to_thread(
-		detections_to_coordinates_payload,
-		dedupe_detections(text_detections + merged_components),
+	combined_counts = merge_counts_with_text_anchors(ocr_counts, visual_counts, text_counts)
+	
+	# Filter detections for coordinates to match component counts exactly
+	# Only include detections that meet the same confidence thresholds used for counting
+	filtered_for_coordinates = []
+	for detection in text_detections + merged_components:
+		category = detection.get("category")
+		conf = float(detection.get("confidence", 1.0))
+		# Only include if it's one of the 4 main types and meets confidence threshold
+		if category in COUNT_KEYS and conf >= CONF_THRESH.get(category, 0.0):
+			filtered_for_coordinates.append(detection)
+	
+	coordinates_task = asyncio.create_task(
+		asyncio.to_thread(
+			detections_to_coordinates_payload,
+			dedupe_detections(filtered_for_coordinates),
+		)
 	)
 	phi3_counts: dict[str, int] | None = None
 	phi3_industry: str | None = None
 	used_ollama = False
-	if OLLAMA_USE_FOR_COUNTS:
+	ollama_task: asyncio.Task[dict[str, Any] | None] | None = None
+	if OLLAMA_ENABLED and (fast_mode or OLLAMA_USE_FOR_COUNTS):
+		ollama_task = asyncio.create_task(
+			asyncio.to_thread(
+				verify_with_ollama,
+				text_blob=text_blob,
+				counts=combined_counts,
+				industry_hint=industry,
+				fast_mode=fast_mode,
+			),
+		)
+
+	if fast_mode:
+		coordinates = await coordinates_task
+		if ollama_task is not None:
+			try:
+				phi3_result = await asyncio.wait_for(ollama_task, timeout=OLLAMA_FAST_TIMEOUT_SECONDS)
+				if phi3_result:
+					phi3_counts = phi3_result["counts"]
+					phi3_industry = phi3_result["industry"]
+					if phi3_industry:
+						industry = phi3_industry
+					used_ollama = True
+					for key in COUNT_KEYS:
+						combined_counts[key] = max(combined_counts.get(key, 0), phi3_counts.get(key, 0))
+			except asyncio.TimeoutError:
+				if not ollama_task.done():
+					ollama_task.cancel()
+				await asyncio.gather(ollama_task, return_exceptions=True)
+			except Exception:
+				if not ollama_task.done():
+					ollama_task.cancel()
+				await asyncio.gather(ollama_task, return_exceptions=True)
+	elif ollama_task is None:
+		coordinates = await coordinates_task
+	else:
 		try:
-			phi3_result, coordinates = await asyncio.gather(
-				asyncio.to_thread(verify_with_ollama, text_blob=text_blob, counts=combined_counts, industry_hint=industry),
-				coordinates_task,
-			)
+			phi3_result, coordinates = await asyncio.gather(ollama_task, coordinates_task)
 			if phi3_result:
 				phi3_counts = phi3_result["counts"]
 				phi3_industry = phi3_result["industry"]
+				if phi3_industry:
+					industry = phi3_industry
 				used_ollama = True
 				# Keep stable behavior by preventing regressions from verifier undercounting.
 				for key in COUNT_KEYS:
 					combined_counts[key] = max(combined_counts.get(key, 0), phi3_counts.get(key, 0))
-				if phi3_industry and phi3_industry.lower() != "unknown":
-					industry = phi3_industry
 		except Exception:
-			used_ollama = False
-			coordinates = detections_to_coordinates_payload(dedupe_detections(text_detections + shape_detections))
-	else:
-		coordinates = await coordinates_task
+			if not coordinates_task.done():
+				coordinates_task.cancel()
+			if ollama_task is not None and not ollama_task.done():
+				ollama_task.cancel()
+			await asyncio.gather(coordinates_task, return_exceptions=True)
+			if ollama_task is not None:
+				await asyncio.gather(ollama_task, return_exceptions=True)
+			raise
+
+	if not coordinates_task.done():
+		coordinates_task.cancel()
+		await asyncio.gather(coordinates_task, return_exceptions=True)
 	return {
 		"ocr_counts": ocr_counts,
 		"vision_counts": visual_counts,
@@ -1201,8 +1554,8 @@ async def analyze_pid_image_async(image: Image.Image) -> dict[str, Any]:
 	}
 
 
-def analyze_pid_image(image: Image.Image) -> dict[str, Any]:
-	return asyncio.run(analyze_pid_image_async(image))
+def analyze_pid_image(image: Image.Image, fast_mode: bool = False) -> dict[str, Any]:
+	return asyncio.run(analyze_pid_image_async(image, fast_mode=fast_mode))
 
 
 def resize_for_fast_processing(image: Image.Image, max_edge: int = 1280) -> tuple[Image.Image, float, float]:

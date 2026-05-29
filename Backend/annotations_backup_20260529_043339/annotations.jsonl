@@ -1,0 +1,9 @@
+{"timestamp": "2026-05-29T04:11:59.841930Z", "image": "20260529_041159_784262_Screenshot 2026-05-29 093806.png", "annotations": [{"label": "motor", "bbox": [0, 0, 164, 121]}]}
+{"timestamp": "2026-05-29T04:21:23.456061Z", "image": "20260529_042123_447846_Screenshot 2026-05-29 093806.png", "annotations": [{"label": "motor", "bbox": [0, 0, 164, 121]}]}
+{"timestamp": "2026-05-29T04:24:40.897317Z", "image": "20260529_042440_853612_Screenshot 2026-05-29 095336.png", "annotations": [{"label": "pump", "bbox": [0, 0, 749, 453]}]}
+{"timestamp": "2026-05-29T04:25:36.604618Z", "image": "20260529_042536_550949_Screenshot 2026-05-29 095336.png", "annotations": [{"label": "pump", "bbox": [12, 2, 365, 439]}]}
+{"timestamp": "2026-05-29T04:26:30.299138Z", "image": "20260529_042630_251495_Screenshot 2026-05-29 095600.png", "annotations": [{"label": "pump", "bbox": [8, 5, 725, 594]}]}
+{"timestamp": "2026-05-29T04:27:49.253961Z", "image": "20260529_042749_206099_Screenshot 2026-05-29 095649.png", "annotations": [{"label": "motor", "bbox": [189, 5, 178, 268]}]}
+{"timestamp": "2026-05-29T04:28:12.550678Z", "image": "20260529_042812_488804_Screenshot 2026-05-29 095649.png", "annotations": [{"label": "pump", "bbox": [0, 268, 749, 481]}]}
+{"timestamp": "2026-05-29T04:28:33.939452Z", "image": "20260529_042833_897059_Screenshot 2026-05-29 095649.png", "annotations": [{"label": "pump", "bbox": [9, 5, 178, 249]}, {"label": "pump", "bbox": [372, 8, 373, 265]}]}
+{"timestamp": "2026-05-29T04:28:58.825721Z", "image": "20260529_042858_779246_Screenshot 2026-05-29 095706.png", "annotations": [{"label": "pump", "bbox": [12, 3, 729, 789]}]}
