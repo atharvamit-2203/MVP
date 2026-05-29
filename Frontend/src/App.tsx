@@ -1,6 +1,80 @@
 import { useEffect, useRef, useState, type DragEvent } from 'react'
 import './App.css'
 
+// SVG Icon Components
+const UploadIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <polyline points="17 8 12 3 7 8" />
+    <line x1="12" y1="3" x2="12" y2="15" />
+  </svg>
+)
+
+const FileIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <polyline points="14 2 14 8 20 8" />
+    <line x1="16" y1="13" x2="8" y2="13" />
+    <line x1="16" y1="17" x2="8" y2="17" />
+    <polyline points="10 9 9 9 8 9" />
+  </svg>
+)
+
+const AnalysisIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="11" cy="11" r="8" />
+    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    <path d="M11 8v6" />
+    <path d="M8 11h6" />
+  </svg>
+)
+
+const CoordinatesIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+    <circle cx="8.5" cy="8.5" r="1.5" />
+    <circle cx="15.5" cy="15.5" r="1.5" />
+    <circle cx="8.5" cy="15.5" r="1.5" />
+    <circle cx="15.5" cy="8.5" r="1.5" />
+  </svg>
+)
+
+const DownloadIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <polyline points="7 10 12 15 17 10" />
+    <line x1="12" y1="15" x2="12" y2="3" />
+  </svg>
+)
+
+const LoadingSpinner = () => (
+  <svg className="spinner" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+  </svg>
+)
+
+const CheckIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="20 6 9 17 4 12" />
+  </svg>
+)
+
+const AlertIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="10" />
+    <line x1="12" y1="8" x2="12" y2="12" />
+    <line x1="12" y1="16" x2="12.01" y2="16" />
+  </svg>
+)
+
+const ComponentIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 2L2 7l10 5 10-5-10-5z" />
+    <path d="M2 17l10 5 10-5" />
+    <path d="M2 12l10 5 10-5" />
+  </svg>
+)
+
 type FrameSummary = {
   page_index: number
   width: number
@@ -20,7 +94,6 @@ type Stage1Response = {
 }
 
 type CategoryCounts = {
-  text: number
   motor: number
   pump: number
   tank: number
@@ -47,6 +120,21 @@ type DetectionResponse = {
   models_used: string[]
   pages: PageDetectionResult[]
   industry: string | null
+}
+
+type BatchAnalysisItem = {
+  filename: string
+  content_type: string | null
+  source_type: 'image' | 'pdf'
+  page_count: number
+  result: Stage1Response
+  detection: DetectionResponse
+  coordinates: CoordinateDetectionResponse
+  error: string | null
+}
+
+type BatchAnalysisResponse = {
+  files: BatchAnalysisItem[]
 }
 
 type ComponentPosition = {
@@ -83,11 +171,19 @@ type CoordinateDetectionResponse = {
   root: Root
 }
 
+type BatchRun = {
+  file: File
+  result: Stage1Response | null
+  detection: DetectionResponse | null
+  coordinates: CoordinateDetectionResponse | null
+  error: string | null
+}
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
-  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [isDragging, setIsDragging] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -95,35 +191,89 @@ function App() {
   const [detection, setDetection] = useState<DetectionResponse | null>(null)
   const [coordinates, setCoordinates] = useState<CoordinateDetectionResponse | null>(null)
   const [selectedPreviewUrl, setSelectedPreviewUrl] = useState<string | null>(null)
+  const [batchRuns, setBatchRuns] = useState<BatchRun[]>([])
   const [activeTab, setActiveTab] = useState<'upload' | 'results' | 'coordinates'>('upload')
+
+  const currentFile = selectedFiles[0] ?? null
 
   const totalDetectedComponents = detection
     ? detection.pages.reduce((sum, page) => {
         const c = page.counts
-        return sum + (c.text ?? 0) + (c.motor ?? 0) + (c.pump ?? 0) + (c.tank ?? 0) + (c.valve ?? 0)
+        return sum + (c.motor ?? 0) + (c.pump ?? 0) + (c.tank ?? 0) + (c.valve ?? 0)
       }, 0)
     : 0
 
-  const supportsPreview = selectedFile
-    ? selectedFile.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(selectedFile.name)
+  const batchTotalDetectedComponents = batchRuns.reduce((sum, run) => {
+    const runTotal = run.detection
+      ? run.detection.pages.reduce((pageSum, page) => {
+          const c = page.counts
+          return pageSum + (c.motor ?? 0) + (c.pump ?? 0) + (c.tank ?? 0) + (c.valve ?? 0)
+        }, 0)
+      : 0
+    return sum + runTotal
+  }, 0)
+
+  const displayedDetectedComponents = batchRuns.length > 0 ? batchTotalDetectedComponents : totalDetectedComponents
+  const displayedCoordinateCount = coordinates ? coordinates.root.children.length : 0
+
+  const supportsPreview = currentFile
+    ? currentFile.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(currentFile.name)
     : false
 
-  const handleFileSelect = (file: File | null) => {
-    setSelectedFile(file)
+  const isTextCoordinate = (component: ComponentChild) => component.type === 'ia.symbol.text' || component.type.endsWith('.text')
+
+  const sanitizeCoordinates = (payload: CoordinateDetectionResponse | null) => {
+    if (!payload) {
+      return payload
+    }
+
+    return {
+      ...payload,
+      root: {
+        ...payload.root,
+        children: payload.root.children.filter((component) => !isTextCoordinate(component)),
+      },
+    }
+  }
+
+  const handleFilesSelect = (files: File[]) => {
+    setSelectedFiles(files)
     setError(null)
     setResult(null)
     setDetection(null)
     setCoordinates(null)
+    setBatchRuns([])
     setActiveTab('upload')
   }
 
-  const postFile = async (endpoint: string) => {
-    if (!selectedFile) {
+  const postFile = async (endpoint: string, file: File) => {
+    if (!file) {
       throw new Error('Choose an image or PDF first.')
     }
 
     const formData = new FormData()
-    formData.append('file', selectedFile)
+    formData.append('file', file)
+
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      method: 'POST',
+      body: formData,
+    })
+
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as { detail?: string } | null
+      throw new Error(payload?.detail ?? `Request failed with status ${response.status}`)
+    }
+
+    return response.json()
+  }
+
+  const postFiles = async (endpoint: string, files: File[]) => {
+    if (!files.length) {
+      throw new Error('Choose one or more images or PDFs first.')
+    }
+
+    const formData = new FormData()
+    files.forEach((file) => formData.append('files', file))
 
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
       method: 'POST',
@@ -140,17 +290,58 @@ function App() {
 
   // Execute upload, detection and coordinate detection sequentially.
   const runAll = async () => {
+    if (!selectedFiles.length) {
+      setError('Choose one or more images or PDFs first.')
+      return
+    }
+
     setIsUploading(true)
     setError(null)
     try {
-      const uploadPayload = (await postFile('/upload')) as Stage1Response
-      setResult(uploadPayload)
+      const runs: BatchRun[] = []
 
-      const detectionPayload = (await postFile('/detect')) as DetectionResponse
-      setDetection(detectionPayload)
+      if (selectedFiles.length === 1) {
+        const file = selectedFiles[0]
+        try {
+          const uploadPayload = (await postFile('/upload', file)) as Stage1Response
+          const detectionPayload = (await postFile('/detect', file)) as DetectionResponse
+          const coordinatesPayload = sanitizeCoordinates((await postFile('/coordinates', file)) as CoordinateDetectionResponse)
+          runs.push({
+            file,
+            result: uploadPayload,
+            detection: detectionPayload,
+            coordinates: coordinatesPayload,
+            error: null,
+          })
+        } catch (fileError) {
+          runs.push({
+            file,
+            result: null,
+            detection: null,
+            coordinates: null,
+            error: fileError instanceof Error ? fileError.message : 'Run failed for file.',
+          })
+        }
+      } else {
+        const batchResponse = (await postFiles('/analyze_batch', selectedFiles)) as BatchAnalysisResponse
 
-      const coordinatesPayload = (await postFile('/coordinates')) as CoordinateDetectionResponse
-      setCoordinates(coordinatesPayload)
+        batchResponse.files.forEach((item, index) => {
+          const file = selectedFiles[index]
+          runs.push({
+            file,
+            result: item.result ?? null,
+            detection: item.detection ?? null,
+            coordinates: sanitizeCoordinates(item.coordinates ?? null),
+            error: item.error ?? null,
+          })
+        })
+      }
+
+      setBatchRuns(runs)
+      const firstSuccess = runs.find((run) => run.result && run.detection && run.coordinates) ?? null
+      setResult(firstSuccess?.result ?? null)
+      setDetection(firstSuccess?.detection ?? null)
+      setCoordinates(firstSuccess?.coordinates ?? null)
       setActiveTab('coordinates')
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Run All failed.')
@@ -164,8 +355,8 @@ function App() {
 
   // Generate download URL whenever we have all data
   useEffect(() => {
-    if (result && detection && coordinates) {
-      const combined = JSON.stringify({ result, detection, coordinates }, null, 2)
+    if (batchRuns.length) {
+      const combined = JSON.stringify({ runs: batchRuns }, null, 2)
       const blob = new Blob([combined], { type: 'application/json' })
       const url = URL.createObjectURL(blob)
       setDownloadUrl(url)
@@ -173,66 +364,97 @@ function App() {
     } else {
       setDownloadUrl(null)
     }
-  }, [result, detection, coordinates])
+  }, [batchRuns])
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
     setIsDragging(false)
-    const droppedFile = event.dataTransfer.files[0] ?? null
-    handleFileSelect(droppedFile)
+    handleFilesSelect(Array.from(event.dataTransfer.files))
   }
 
   useEffect(() => {
-    if (!selectedFile || !supportsPreview) {
+    if (!currentFile || !supportsPreview) {
       setSelectedPreviewUrl(null)
       return
     }
 
-    const previewUrl = URL.createObjectURL(selectedFile)
+    const previewUrl = URL.createObjectURL(currentFile)
     setSelectedPreviewUrl(previewUrl)
 
     return () => URL.revokeObjectURL(previewUrl)
-  }, [selectedFile, supportsPreview])
+  }, [currentFile, supportsPreview])
 
   return (
     <div className="dashboard">
       <aside className="sidebar">
         <div className="brand">
+          <div className="brand-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 2L2 7l10 5 10-5-10-5z" />
+              <path d="M2 17l10 5 10-5" />
+              <path d="M2 12l10 5 10-5" />
+            </svg>
+          </div>
           <h2>P&ID Dashboard</h2>
+          <p className="brand-tagline">AI-Powered Analysis</p>
         </div>
 
         <nav className="nav">
           <button
             className="primary-button"
             onClick={runAll}
-            disabled={isUploading || !selectedFile}
+            disabled={isUploading || selectedFiles.length === 0}
           >
-            {isUploading ? 'Processing...' : 'Run All'}
+            {isUploading ? (
+              <span className="button-content">
+                <LoadingSpinner />
+                Processing...
+              </span>
+            ) : (
+              <span className="button-content">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                Run Analysis
+              </span>
+            )}
           </button>
           {downloadUrl && (
-            <a href={downloadUrl} download="output.json" className="secondary-button">
-              Download JSON
+            <a href={downloadUrl} download="output.json" className="secondary-button download-button">
+              <span className="button-content">
+                <DownloadIcon />
+                Download JSON
+              </span>
             </a>
           )}
           <button 
             className={`nav-item ${activeTab === 'upload' ? 'active' : ''}`}
             onClick={() => setActiveTab('upload')}
           >
-            Upload
+            <span className="nav-item-content">
+              <UploadIcon />
+              Upload
+            </span>
           </button>
           <button 
             className={`nav-item ${activeTab === 'results' ? 'active' : ''}`}
             onClick={() => setActiveTab('results')}
             disabled={!detection}
           >
-            Analysis
+            <span className="nav-item-content">
+              <AnalysisIcon />
+              Analysis
+            </span>
           </button>
           <button 
             className={`nav-item ${activeTab === 'coordinates' ? 'active' : ''}`}
             onClick={() => setActiveTab('coordinates')}
             disabled={!coordinates}
           >
-            Coordinates
+            <span className="nav-item-content">
+              <CoordinatesIcon />
+              Coordinates
+            </span>
           </button>
         </nav>
       </aside>
@@ -244,8 +466,13 @@ function App() {
               {detection?.industry ? `Industry: ${detection.industry}` : 'Stage 1 - Image Input'}
             </div>
             <h1>P&ID Analysis Dashboard</h1>
+            <p className="subtitle">Upload P&ID diagrams for AI-powered component detection and analysis</p>
           </div>
           <div className="topbar-right">
+            <div className="status-indicator">
+              <span className="status-dot"></span>
+              <span>System Ready</span>
+            </div>
             <div className="meta-row">
               <span>Backend: {API_BASE_URL}</span>
               <span>Accepts PNG, JPG, WEBP, BMP, TIFF, PDF</span>
@@ -284,6 +511,12 @@ function App() {
                       The backend will render PDF pages, preprocess the image, and return a
                       per-page preview payload.
                     </p>
+                    <div className="supported-formats">
+                      <span className="format-tag">PNG</span>
+                      <span className="format-tag">JPG</span>
+                      <span className="format-tag">WEBP</span>
+                      <span className="format-tag">PDF</span>
+                    </div>
                   </div>
 
                   <div className="upload-controls">
@@ -291,34 +524,105 @@ function App() {
                       ref={fileInputRef}
                       className="file-input"
                       type="file"
+                      multiple
                       accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.pdf"
-                      onChange={(event) => handleFileSelect(event.target.files?.[0] ?? null)}
+                      onChange={(event) => handleFilesSelect(Array.from(event.target.files ?? []))}
                     />
-                    <button type="button" className="secondary-button" onClick={() => fileInputRef.current?.click()}>
-                      Browse files
+                    <button type="button" className="secondary-button browse-button" onClick={() => fileInputRef.current?.click()}>
+                      <span className="button-content">
+                        <FileIcon />
+                        Browse files
+                      </span>
                     </button>
-
+                    <p className="upload-hint">or drag and drop your file here</p>
                   </div>
 
                   <div className="selection-row">
                     <div>
                       <span className="label">Selected file</span>
-                      <strong>{selectedFile?.name ?? 'None yet'}</strong>
+                      <strong>{currentFile?.name ?? 'None yet'}</strong>
                     </div>
                     <div>
                       <span className="label">Type</span>
-                      <strong>{selectedFile?.type || 'Unknown'}</strong>
+                      <strong>{currentFile?.type || 'Unknown'}</strong>
                     </div>
                     <div>
                       <span className="label">Size</span>
-                      <strong>{selectedFile ? `${(selectedFile.size / 1024).toFixed(1)} KB` : '--'}</strong>
+                      <strong>{currentFile ? `${(currentFile.size / 1024).toFixed(1)} KB` : '--'}</strong>
                     </div>
                   </div>
 
-                  {error ? <div className="status error">{error}</div> : null}
-                  {!error && result && !detection ? <div className="status success">Stage 1 completed successfully. Ready for AI analysis.</div> : null}
-                  {!error && detection ? <div className="status success">AI detection completed! Industry identified: {detection.industry || 'Unknown'}</div> : null}
-                  {!error && coordinates ? <div className="status success">Coordinate detection completed! {coordinates.root.children.length} components found.</div> : null}
+                  <div className="selection-row">
+                    <div>
+                      <span className="label">Queued files</span>
+                      <strong>{selectedFiles.length}</strong>
+                    </div>
+                    <div>
+                      <span className="label">Batch mode</span>
+                      <strong>{selectedFiles.length > 1 ? 'Enabled' : 'Single file'}</strong>
+                    </div>
+                  </div>
+
+                  {error ? (
+                    <div className="status error">
+                      <span className="status-icon"><AlertIcon /></span>
+                      {error}
+                    </div>
+                  ) : null}
+                  {!error && result && !detection ? (
+                    <div className="status success">
+                      <span className="status-icon"><CheckIcon /></span>
+                      Stage 1 completed successfully. Ready for AI analysis.
+                    </div>
+                  ) : null}
+                  {!error && detection ? (
+                    <div className="status success">
+                      <span className="status-icon"><CheckIcon /></span>
+                      AI detection completed! Industry identified: {detection.industry || 'Unknown'}
+                    </div>
+                  ) : null}
+                  {!error && coordinates ? (
+                    <div className="status success">
+                      <span className="status-icon"><CheckIcon /></span>
+                      Coordinate detection completed! {displayedCoordinateCount} visible components found.
+                    </div>
+                  ) : null}
+
+                  {batchRuns.length > 1 ? (
+                    <section className="results-grid compact">
+                      <article className="result-card wide">
+                        <div className="card-header">
+                          <div>
+                            <div className="pill muted">Batch</div>
+                            <h2>Processed files</h2>
+                          </div>
+                        </div>
+                        <div className="frame-grid">
+                          {batchRuns.map((run) => (
+                            <div className="frame-card" key={run.file.name}>
+                              <div className="frame-meta">
+                                <strong>{run.file.name}</strong>
+                                <span>{run.error ? `Error: ${run.error}` : 'Completed'}</span>
+                                <span>Industry: {run.detection?.industry || 'Unknown'}</span>
+                                <span>
+                                  {run.detection
+                                    ? run.detection.pages.reduce((sum, page) => {
+                                        const c = page.counts
+                                        return sum + (c.motor ?? 0) + (c.pump ?? 0) + (c.tank ?? 0) + (c.valve ?? 0)
+                                      }, 0)
+                                    : 0}{' '}
+                                  components
+                                </span>
+                                <span>
+                                  Coordinates: {run.coordinates?.root.children.length ?? 0}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </article>
+                    </section>
+                  ) : null}
 
                   {result ? (
                     <section className="results-grid compact">
@@ -394,9 +698,21 @@ function App() {
                   </div>
 
                   {selectedPreviewUrl ? (
-                    <img className="preview-image" src={selectedPreviewUrl} alt="Selected upload preview" />
+                    <div className="preview-wrapper">
+                      <img className="preview-image" src={selectedPreviewUrl} alt="Selected upload preview" />
+                      <div className="preview-overlay">
+                        <span className="preview-badge">Original</span>
+                      </div>
+                    </div>
                   ) : (
                     <div className="empty-state">
+                      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                        <circle cx="8.5" cy="8.5" r="1.5" />
+                        <circle cx="15.5" cy="15.5" r="1.5" />
+                        <circle cx="8.5" cy="15.5" r="1.5" />
+                        <circle cx="15.5" cy="8.5" r="1.5" />
+                      </svg>
                       <span>Image previews appear here.</span>
                       <p>PDFs are summarized after upload because the browser preview is text-free.</p>
                     </div>
@@ -454,7 +770,7 @@ function App() {
                         </div>
 
                         <div className="category-chips">
-                          {(['text', 'motor', 'pump', 'tank', 'valve'] as const).map((category) => {
+                          {(['motor', 'pump', 'tank', 'valve'] as const).map((category) => {
                             const count = page.counts[category]
                             return (
                               <span className="category-chip" key={category}>
@@ -465,7 +781,7 @@ function App() {
                         </div>
 
                         <div className="count-grid">
-                          {(['text', 'motor', 'pump', 'tank', 'valve'] as const).map((category) => (
+                          {(['motor', 'pump', 'tank', 'valve'] as const).map((category) => (
                             <div className="count-card" key={category}>
                               <span>{category}</span>
                               <strong>{page.counts[category]}</strong>
@@ -486,19 +802,60 @@ function App() {
             <>
               <section className="hero-panel compact-hero">
                   <p className="lede">
-                    Component coordinates for {selectedFile?.name || 'uploaded file'} - {coordinates.root.children.length} components detected
+                    Component coordinates for {currentFile?.name || 'uploaded file'} - {displayedCoordinateCount} components detected
                   </p>
                   <p className="lede">
-                    Detected components total: {totalDetectedComponents}<br />
-                    Coordinate entries: {coordinates.root.children.length}<br />
-                    Difference: {totalDetectedComponents - coordinates.root.children.length}
+                    Detected components total: {displayedDetectedComponents}<br />
+                    Coordinate entries: {displayedCoordinateCount}<br />
+                    Difference: {displayedDetectedComponents - displayedCoordinateCount}
                   </p>
-                  {totalDetectedComponents - coordinates.root.children.length > 0 && (
-                    <p className="warning" style={{ color: 'orange' }}>
-                      Warning: {totalDetectedComponents - coordinates.root.children.length} component(s) missing coordinates.
-                    </p>
+                  {displayedDetectedComponents - displayedCoordinateCount > 0 && (
+                    <div className="warning-banner">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                        <line x1="12" y1="9" x2="12" y2="13" />
+                        <line x1="12" y1="17" x2="12.01" y2="17" />
+                      </svg>
+                      <span>Warning: {displayedDetectedComponents - displayedCoordinateCount} component(s) missing coordinates.</span>
+                    </div>
                   )}
                 </section>
+
+              {batchRuns.length > 1 ? (
+                <section className="workspace">
+                  <article className="result-card wide">
+                    <div className="card-header">
+                      <div>
+                        <div className="pill muted">Batch</div>
+                        <h2>Visible coordinates by file</h2>
+                      </div>
+                    </div>
+                    <div className="frame-grid">
+                      {batchRuns.map((run) => {
+                        const visibleCount = run.coordinates?.root.children.length ?? 0
+                        return (
+                          <div className="frame-card" key={run.file.name}>
+                            <div className="frame-meta">
+                              <strong>{run.file.name}</strong>
+                              <span>Industry: {run.detection?.industry || 'Unknown'}</span>
+                              <span>{visibleCount} visible coordinates</span>
+                              <span>
+                                Components: {run.detection
+                                  ? run.detection.pages.reduce((sum, page) => {
+                                      const c = page.counts
+                                      return sum + (c.motor ?? 0) + (c.pump ?? 0) + (c.tank ?? 0) + (c.valve ?? 0)
+                                    }, 0)
+                                  : 0}
+                              </span>
+                              <span>{run.error ? `Error: ${run.error}` : 'Ready'}</span>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </article>
+                </section>
+              ) : null}
 
               <section className="workspace">
                 <article className="result-card">
@@ -527,6 +884,7 @@ function App() {
                         <div className="coordinate-header">
                           <div className="pill component-type">{component.type.replace('ia.symbol.', '')}</div>
                           <strong>{component.meta.name}</strong>
+                          <span className="component-icon"><ComponentIcon /></span>
                         </div>
                         <div className="coordinate-details">
                           <div className="coordinate-item">

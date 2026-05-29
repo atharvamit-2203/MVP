@@ -1,0 +1,114 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>P&ID Annotator</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 16px; }
+    #canvas { border: 1px solid #ccc; cursor: crosshair; }
+    .controls { margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h3>P&ID Annotator</h3>
+  <p>Upload an image, draw boxes, choose label, then submit annotations.</p>
+  <input type="file" id="fileInput" accept="image/*" />
+  <br/>
+  <canvas id="canvas"></canvas>
+  <div class="controls">
+    <label for="labelSelect">Label:</label>
+    <select id="labelSelect">
+      <option value="motor">motor</option>
+      <option value="pump">pump</option>
+      <option value="tank">tank</option>
+      <option value="valve">valve</option>
+      <option value="other">other</option>
+    </select>
+    <button id="addBox">Add Box</button>
+    <button id="undo">Undo</button>
+    <button id="submit">Submit Annotations</button>
+  </div>
+  <pre id="status"></pre>
+<script>
+const fileInput = document.getElementById('fileInput');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const labelSelect = document.getElementById('labelSelect');
+const addBoxBtn = document.getElementById('addBox');
+const undoBtn = document.getElementById('undo');
+const submitBtn = document.getElementById('submit');
+const status = document.getElementById('status');
+
+let img = new Image();
+let boxes = [];
+let start = null;
+let currentFilename = null;
+
+fileInput.addEventListener('change', (e)=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  currentFilename = f.name;
+  const reader = new FileReader();
+  reader.onload = function(ev){
+    img.onload = () => {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img,0,0);
+      drawAll();
+    };
+    img.src = ev.target.result;
+  };
+  reader.readAsDataURL(f);
+});
+
+canvas.addEventListener('mousedown', (e)=>{
+  const r = canvas.getBoundingClientRect();
+  start = {x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top)};
+});
+canvas.addEventListener('mouseup', (e)=>{
+  if(!start) return;
+  const r = canvas.getBoundingClientRect();
+  const end = {x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top)};
+  const x = Math.min(start.x, end.x);
+  const y = Math.min(start.y, end.y);
+  const w = Math.abs(end.x - start.x);
+  const h = Math.abs(end.y - start.y);
+  if(w>5 && h>5){
+    boxes.push({label: labelSelect.value, bbox:[x,y,w,h]});
+    drawAll();
+  }
+  start = null;
+});
+
+function drawAll(){
+  ctx.clearRect(0,0,canvas.width, canvas.height);
+  ctx.drawImage(img,0,0);
+  ctx.lineWidth = 2;
+  boxes.forEach((b,i)=>{
+    ctx.strokeStyle = 'red';
+    ctx.strokeRect(b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]);
+    ctx.fillStyle = 'red';
+    ctx.fillText(b.label, b.bbox[0]+4, b.bbox[1]+12);
+  });
+}
+
+undoBtn.addEventListener('click', ()=>{ boxes.pop(); drawAll(); });
+
+submitBtn.addEventListener('click', async ()=>{
+  if(!currentFilename){ status.textContent='Upload an image first.'; return; }
+  const f = fileInput.files[0];
+  if(!f){ status.textContent='No file.'; return; }
+  status.textContent = 'Submitting...';
+  const form = new FormData();
+  form.append('file', f);
+  form.append('annotations', JSON.stringify(boxes));
+  form.append('page_index', '1');
+  try{
+    const res = await fetch('/annotate', {method:'POST', body: form});
+    const data = await res.json();
+    status.textContent = JSON.stringify(data, null, 2);
+  }catch(err){ status.textContent = String(err); }
+});
+</script>
+</body>
+</html>
