@@ -21,6 +21,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 if __package__:
+	from . import local_detection
 	from .local_detection import analyze_pid_image, detect_coordinates, analyze_pid_image_async, detect_coordinates_async
 	from . import active_learning
 else:
@@ -29,6 +30,7 @@ else:
 	current_dir = Path(__file__).resolve().parent
 	if str(current_dir) not in sys.path:
 		sys.path.insert(0, str(current_dir))
+	import local_detection
 	from local_detection import analyze_pid_image, detect_coordinates, analyze_pid_image_async, detect_coordinates_async
 	import active_learning
 
@@ -42,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(BACKEND_ROOT / ".env")
+
+ML_COUNT_MIN_CONFIDENCE = float(os.getenv("ML_COUNT_MIN_CONFIDENCE", "0.55"))
 
 app = FastAPI(title="Sarla P&ID Backend", version="0.3.0")
 
@@ -260,6 +264,47 @@ def counts_to_model(counts: dict[str, int]) -> CategoryCounts:
 	)
 
 
+def model_counts_to_dict(counts: CategoryCounts) -> dict[str, int]:
+	return {
+		"motor": int(counts.motor),
+		"pump": int(counts.pump),
+		"tank": int(counts.tank),
+		"valve": int(counts.valve),
+	}
+
+
+def _active_model_blob() -> dict[str, Any] | None:
+	return active_learning.load_model_cached()
+
+
+def _predict_trained_model_counts(frame: Image.Image, detections: list[dict[str, Any]]) -> tuple[dict[str, int], list[dict[str, Any]]]:
+	model_blob = _active_model_blob()
+	if model_blob is None or not detections:
+		return {key: 0 for key in local_detection.COUNT_KEYS}, []
+
+	image_array = np.array(frame.convert("RGB"))
+	scored = active_learning.predict_candidates(image_array, detections, model_blob=model_blob)
+	counts = {key: 0 for key in local_detection.COUNT_KEYS}
+	for candidate in scored:
+		predicted = candidate.get("predicted")
+		prob = float(candidate.get("prob", 0.0) or 0.0)
+		fallback_category = candidate.get("category")
+		fallback_conf = float(candidate.get("confidence", 0.0) or 0.0)
+		if predicted in counts and prob >= ML_COUNT_MIN_CONFIDENCE:
+			counts[predicted] += 1
+		elif fallback_category in counts and fallback_conf >= local_detection.CONF_THRESH.get(fallback_category, 0.0):
+			counts[fallback_category] += 1
+	return counts, scored
+
+
+def _merge_count_dicts(*count_dicts: dict[str, int]) -> dict[str, int]:
+	merged = {key: 0 for key in local_detection.COUNT_KEYS}
+	for counts in count_dicts:
+		for key in local_detection.COUNT_KEYS:
+			merged[key] = max(merged[key], int(counts.get(key, 0)))
+	return merged
+
+
 async def build_stage1_response(file: UploadFile) -> Stage1Response:
 	file_bytes = await file.read()
 	if not file_bytes:
@@ -311,6 +356,8 @@ async def build_detection_response(file: UploadFile) -> DetectionResponse:
 
 	industry = "Unknown"
 	models_used = ["opencv+paddleocr", "opencv+heuristics"]
+	if _active_model_blob() is not None:
+		models_used.append("active_learning/random_forest")
 	if frames:
 		try:
 			analysis = await asyncio.to_thread(analyze_pid_image, frames[0])
@@ -342,27 +389,16 @@ async def build_coordinate_response(file: UploadFile) -> CoordinateDetectionResp
 		raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 	try:
-		vision_coordinates = await detect_coordinates_async(frames[0])
-		vision_count = len(vision_coordinates.get("root", {}).get("children", []))
-
 		local_result = await analyze_pid_image_async(frames[0])
 		local_coordinates = local_result.get("coordinates", {})
 		local_count = len(local_coordinates.get("root", {}).get("children", []))
-
-		logger.info(f"Vision model detected {vision_count} components, local detection found {local_count}")
-
-		if vision_count >= max(1, local_count * 0.5):
-			logger.info("Using vision model coordinates")
-			coordinates = vision_coordinates
-		else:
-			logger.info("Using local detection coordinates (vision model fallback)")
-			coordinates = local_coordinates
+		coordinates = local_coordinates
+		logger.info(f"Using local detection coordinates with {local_count} components")
 
 	except Exception as exc:  # noqa: BLE001
 		logger.error(f"Coordinate detection failed: {exc}")
 		try:
-			local_result = await analyze_pid_image_async(frames[0])
-			coordinates = local_result.get("coordinates", {})
+			coordinates = await detect_coordinates_async(frames[0])
 			logger.info("Fallback to local detection successful")
 		except Exception as fallback_exc:  # noqa: BLE001
 			logger.error(f"Fallback detection also failed: {fallback_exc}")
@@ -377,6 +413,10 @@ def counts_from_analysis_page(analysis: dict[str, Any], page_index: int) -> Page
 	final_counts = counts_to_model(analysis["counts"])
 	phi3_counts_raw = analysis.get("phi3_counts")
 	phi3_counts = counts_to_model(phi3_counts_raw) if isinstance(phi3_counts_raw, dict) else None
+	trained_counts_raw = analysis.get("trained_counts")
+	trained_counts = counts_to_model(trained_counts_raw) if isinstance(trained_counts_raw, dict) else None
+	if trained_counts is not None:
+		final_counts = counts_to_model(_merge_count_dicts(model_counts_to_dict(final_counts), trained_counts_raw))
 	model_results = [
 		ModelDetectionResult(
 			page_index=page_index,
@@ -391,6 +431,15 @@ def counts_from_analysis_page(analysis: dict[str, Any], page_index: int) -> Page
 			counts=vision_counts,
 		),
 	]
+	if trained_counts is not None:
+		model_results.append(
+			ModelDetectionResult(
+				page_index=page_index,
+				model="active_learning/random_forest",
+				role="detection",
+				counts=trained_counts,
+			),
+		)
 	if phi3_counts is not None:
 		model_results.append(
 			ModelDetectionResult(
@@ -437,11 +486,8 @@ async def build_batch_analysis_item(file: UploadFile) -> BatchAnalysisItem:
 			frames=stage1_frames,
 		)
 
+		page_results = await detect_pages(frames)
 		first_analysis = await asyncio.to_thread(analyze_pid_image, frames[0])
-		if len(frames) == 1:
-			page_results = [counts_from_analysis_page(first_analysis, 1)]
-		else:
-			page_results = await detect_pages(frames)
 		page_detection = DetectionResponse(
 			filename=file.filename or "uploaded-file",
 			content_type=file.content_type,
@@ -473,6 +519,8 @@ async def detect_pages(frames: list[Image.Image]) -> list[PageDetectionResult]:
 	async def analyze_page(page_index: int, frame: Image.Image) -> PageDetectionResult:
 		async with semaphore:
 			analysis = await asyncio.to_thread(analyze_pid_image, frame)
+			trained_counts, _scored = _predict_trained_model_counts(frame, list(analysis.get("detections", [])))
+			analysis["trained_counts"] = trained_counts
 			return counts_from_analysis_page(analysis, page_index)
 
 	results = await asyncio.gather(*(analyze_page(page_index, frame) for page_index, frame in enumerate(frames, start=1)))

@@ -63,7 +63,7 @@ INDUSTRY_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 TEXT_CATEGORY_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 	("motor", ("mtr", "m-", "mo-", "motor-")),
 	("pump", ("p-", "pu-", "pmp", "pump-")),
-	("tank", ("tk-", "t-", "vessel-", "tank-")),
+	("tank", ("tk-", "t-", "vessel-", "tank-", "column")),
 	("valve", ("xv", "cv", "hv", "lv", "sv", "pv", "tv", "gv", "bv", "wv", "pcv", "fcv", "lcv", "tcv", "psv", "nrv", "sdv", "mov", "sov")),
 ]
 
@@ -75,7 +75,6 @@ INITIAL_PREFIX_MAP: dict[str, str] = {
     "v": "valve",
 }
 
-# Stronger tag-level rules for P&ID labels.
 CATEGORY_REGEX_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 	(
 		"valve",
@@ -84,11 +83,12 @@ CATEGORY_REGEX_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 			r"\b(?:pcv|fcv|lcv|tcv|psv|nrv|sdv|xv|hv|lv|fv|sv|cv|tv|pv|mov|sov|bv|gv|wv)\b",
 			r"\b(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-?\d{1,5}[a-z]?\b",
 			r"\b(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)\d{1,5}[a-z]?\b",
+			r"\bvalve\b",
 		),
 	),
-	("pump", (r"\bp-?\d{2,5}[a-z]?\b", r"\bpu-?\d{2,5}[a-z]?\b", r"\bpmp-?\d{1,5}[a-z]?\b")),
-	("motor", (r"\bm-?\d{2,5}[a-z]?\b", r"\bmo-?\d{2,5}[a-z]?\b", r"\bmtr-?\d{1,5}[a-z]?\b")),
-	("tank", (r"\b(?:tk|t|v)-?\d{2,5}[a-z]?\b", r"\btk-?\d{1,5}[a-z]?\b")),
+	("pump", (r"\bp-?\d{2,5}[a-z]?\b", r"\bpu-?\d{2,5}[a-z]?\b", r"\bpmp-?\d{1,5}[a-z]?\b", r"\bpump\b")),
+	("motor", (r"\bm-?\d{2,5}[a-z]?\b", r"\bmo-?\d{2,5}[a-z]?\b", r"\bmtr-?\d{1,5}[a-z]?\b", r"\bmotor\b")),
+	("tank", (r"\b(?:tk|t|v)-?\d{2,5}[a-z]?\b", r"\btk-?\d{1,5}[a-z]?\b", r"\btank\b", r"\bvessel\b", r"\bcolumn\b")),
 ]
 
 OCR_MIN_TEXT_CONFIDENCE = float(os.getenv("OCR_MIN_TEXT_CONFIDENCE", "0.2"))
@@ -106,10 +106,10 @@ OLLAMA_USE_FOR_COUNTS = os.getenv("OLLAMA_USE_FOR_COUNTS", "false").strip().lowe
 
 # Minimum confidence required to count a visual detection for each category.
 CONF_THRESH: dict[str, float] = {
-	"motor": 0.6,
-	"pump": 0.5,
-	"tank": 0.5,
-	"valve": 0.6,
+	"motor": 0.65,
+	"pump": 0.60,
+	"tank": 0.55,
+	"valve": 0.65,
 }
 
 
@@ -147,13 +147,22 @@ def prepare_ocr_image(image_array: np.ndarray) -> np.ndarray:
 	h, w = image_array.shape[:2]
 	max_edge = max(h, w)
 	prepared = image_array
-	if max_edge < 1800:
-		scale = 1800.0 / max_edge
+	if max_edge < 2400:
+		scale = 2400.0 / max_edge
 		prepared = cv2.resize(image_array, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 	gray = cv2.cvtColor(prepared, cv2.COLOR_RGB2GRAY)
+	
+	# Denoise for bad quality images
+	gray = cv2.fastNlMeansDenoising(gray, h=10)
+	
 	clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 	boosted = clahe.apply(gray)
-	return cv2.cvtColor(boosted, cv2.COLOR_GRAY2RGB)
+	
+	# Unsharp masking for clearer text
+	gaussian = cv2.GaussianBlur(boosted, (0, 0), 2.0)
+	sharpened = cv2.addWeighted(boosted, 1.5, gaussian, -0.5, 0)
+	
+	return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
 
 
 def iou(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
@@ -430,26 +439,35 @@ def extract_counts_from_text(text_blob: str) -> dict[str, int]:
 	counts = empty_counts()
 
 	# Pumps: explicit tags only (avoid counting plain text labels like "pump")
-	pumps = re.findall(r"\bp-?\d{1,5}[a-z]?\b", text)
-	pumps += re.findall(r"\bpu-?\d{1,5}[a-z]?\b", text)
-	pumps += re.findall(r"\bpmp-?\d{1,5}[a-z]?\b", text)
+	# Require at least 2 digits to avoid false matches
+	pumps = re.findall(r"\bp-?\d{2,5}[a-z]?\b", text)
+	pumps += re.findall(r"\bpu-?\d{2,5}[a-z]?\b", text)
+	pumps += re.findall(r"\bpmp-?\d{2,5}[a-z]?\b", text)
+	# Filter out matches that are part of longer words
+	pumps = [p for p in pumps if len(p) <= 10]
 	counts["pump"] = max(counts["pump"], len(set(pumps)))
 
 	# Motors: explicit tags only
-	motors = re.findall(r"\bm-?\d{1,5}[a-z]?\b", text)
-	motors += re.findall(r"\bmo-?\d{1,5}[a-z]?\b", text)
-	motors += re.findall(r"\bmtr-?\d{1,5}[a-z]?\b", text)
+	motors = re.findall(r"\bm-?\d{2,5}[a-z]?\b", text)
+	motors += re.findall(r"\bmo-?\d{2,5}[a-z]?\b", text)
+	motors += re.findall(r"\bmtr-?\d{2,5}[a-z]?\b", text)
+	# Filter out matches that are part of longer words
+	motors = [m for m in motors if len(m) <= 10]
 	counts["motor"] = max(counts["motor"], len(set(motors)))
 
 	# Tanks: explicit tags only
-	tanks = re.findall(r"\bt-?\d{1,5}[a-z]?\b", text)
-	tanks += re.findall(r"\btk-?\d{1,5}[a-z]?\b", text)
-	tanks += re.findall(r"\bv-?\d{1,5}[a-z]?\b", text)
+	tanks = re.findall(r"\bt-?\d{2,5}[a-z]?\b", text)
+	tanks += re.findall(r"\btk-?\d{2,5}[a-z]?\b", text)
+	tanks += re.findall(r"\bv-?\d{2,5}[a-z]?\b", text)
+	# Filter out matches that are part of longer words
+	tanks = [t for t in tanks if len(t) <= 10]
 	counts["tank"] = max(counts["tank"], len(set(tanks)))
 
 	# Valves: explicit tags only
-	valves = re.findall(r"\b(?:xv|cv|hv|lv|sv|pv|tv|gv|bv|wv|pcv|fcv|lcv|tcv|psv|nrv|sdv|mov|sov)\b", text)
-	valves += re.findall(r"\b(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-?\d{1,5}[a-z]?\b", text)
+	valves = re.findall(r"\b(?:xv|cv|hv|lv|sv|pv|tv|gv|bv|wv|pcv|fcv|lcv|tcv|psv|nrv|sdv|mov|sov)-?\d{2,5}[a-z]?\b", text)
+	valves += re.findall(r"\b(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-?\d{2,5}[a-z]?\b", text)
+	# Filter out matches that are part of longer words
+	valves = [v for v in valves if len(v) <= 10]
 	counts["valve"] = max(counts["valve"], len(set(valves)))
 
 	return counts
@@ -457,13 +475,17 @@ def extract_counts_from_text(text_blob: str) -> dict[str, int]:
 
 def preprocess_for_shapes(image_array: np.ndarray) -> np.ndarray:
 	gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+	
+	# Denoise for bad quality images while preserving edges
+	gray = cv2.bilateralFilter(gray, 9, 75, 75)
+	
 	blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 	adaptive = cv2.adaptiveThreshold(
 		blurred,
 		255,
 		cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
 		cv2.THRESH_BINARY_INV,
-		35,
+		41,
 		10,
 	)
 	# Close small interior gaps to preserve hollow shapes like tanks
@@ -485,6 +507,9 @@ def detect_text_driven_components(ocr_detections: list[dict[str, Any]]) -> tuple
 		text_blob_parts.append(text)
 		category = classify_text_label(text)
 		if category is None:
+			continue
+		# Only count if confidence is reasonable
+		if detection.get("confidence", 0.0) < 0.3:
 			continue
 		counts[category] += 1
 		components.append(
@@ -535,22 +560,29 @@ def classify_visual_candidate(
 	nearby_blob = " ".join(item["normalized_text"] for item in nearby)
 	nearby_text = " ".join(item["text"] for item in nearby).strip()
 	confidence = 0.0
+	
+	# Reject shape candidates that are essentially just unclassified text blobs
+	for det in nearby:
+		if iou(candidate_box, det["bbox"]) > 0.6:
+			text_cat = classify_text_label(det.get("normalized_text", ""))
+			if not text_cat:
+				return None, "", 0.0
+
+	valve_like_geometry = (
+		3 <= vertex_count <= 10
+		and 0.35 <= aspect_ratio <= 4.5
+		and 0.08 <= circularity <= 0.75
+		and 0.10 <= extent <= 0.82
+		and solidity <= 0.85
+	)
 
 	if nearby_blob:
 		nearby_category = classify_text_label(nearby_blob)
 		if nearby_category is not None:
-			# Require that at least one nearby OCR bbox actually overlaps the candidate
-			# by a modest IoU before promoting the visual candidate from text-only evidence.
-			any_overlap = False
-			for det in nearby:
-				try:
-					if iou(candidate_box, det["bbox"]) >= 0.20:
-						any_overlap = True
-				except Exception:
-					continue
-			if any_overlap:
-				confidence = 0.9
-				return nearby_category, nearby_text or nearby_category.title(), confidence
+			# If the text is nearby (within the 35% padded box), we can trust it to classify the shape.
+			# We relax the strict 20% IoU overlap requirement because P&ID labels are often adjacent.
+			confidence = 0.9
+			return nearby_category, nearby_text or nearby_category.title(), confidence
 
 		# If no nearby_category, try compact-initial mapping on individual OCR tokens
 		if not nearby_category:
@@ -560,21 +592,37 @@ def classify_visual_candidate(
 				except Exception:
 					initial_map = None
 				if initial_map:
-					# require overlap to avoid picking unrelated nearby labels
-					any_overlap = any(iou(candidate_box, det2["bbox"]) >= 0.20 for det2 in nearby)
-					if any_overlap:
-						confidence = 0.88
-						return initial_map, det.get("text") or initial_map.title(), confidence
+					confidence = 0.88
+					return initial_map, det.get("text") or initial_map.title(), confidence
+
+	# Strong geometry-first valve fallback.
+	# Compact bow-tie / diamond / check-valve symbols often have a low solidity,
+	# lower circularity, and a near-square footprint even when vertex counting is noisy.
+	if (
+		3 <= vertex_count <= 12
+		and 0.65 <= aspect_ratio <= 1.6
+		and 0.05 <= circularity <= 0.78
+		and 0.08 <= extent <= 0.80
+		and solidity <= 0.92
+		and area <= 12000
+	):
+		confidence = min(0.9, 0.4 + (0.2 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0))) + (0.2 if vertex_count >= 5 else 0.0) + (0.1 if solidity <= 0.7 else 0.0))
+		return "valve", nearby_text or "Valve", confidence
 
 	# Additional valve-only promotion when the text looks like a common tag.
-	# Require actual overlap with at least one OCR bbox to avoid labeling large text blocks.
-	if re.search(r"\b(?:xv|cv|hv|lv|sv|pv|tv|gv|bv|wv|pcv|fcv|lcv|tcv|psv|nrv|sdv|mov|sov)\b", nearby_blob) and any_overlap:
+	if re.search(r"\b(?:xv|cv|hv|lv|sv|pv|tv|gv|bv|wv|pcv|fcv|lcv|tcv|psv|nrv|sdv|mov|sov)\b", nearby_blob) and len(nearby) > 0:
 		# Reject promotion for candidates that are very low-extent/low-solidity (likely a text region).
 		if extent < 0.12 or solidity < 0.20:
 			pass
 		else:
 			confidence = 0.85
 			return "valve", nearby_text or "Valve", confidence
+
+	# Geometry-first valve promotion: compact bow-tie / diamond / triangle-like symbols
+	# should resolve to valve before the looser pump/motor heuristics below.
+	if valve_like_geometry and area <= 6000:
+		confidence = min(0.88, 0.35 + (extent * 0.25) + (solidity * 0.25) + (0.25 if vertex_count >= 5 else 0.0))
+		return "valve", nearby_text or "Valve", confidence
 
 	# Valves are often compact symbols (diamond/triangle/bow-tie) with specific geometry.
 	# Tighten thresholds to reduce false positives from other small shapes.
@@ -585,24 +633,40 @@ def classify_visual_candidate(
 
 	# Pumps are often elongated machine symbols with moderate circularity
 	# Improved thresholds for pump detection
-	if 1.1 <= aspect_ratio <= 6.0 and area >= 200 and extent >= 0.2 and solidity >= 0.35:
+	if 1.1 <= aspect_ratio <= 6.0 and area >= 200 and extent >= 0.2 and solidity >= 0.35 and not valve_like_geometry:
 		confidence = min(0.75, (extent + solidity + (1.0 / aspect_ratio)) / 3.0)
 		return "pump", nearby_text or "Pump", confidence
-
-	# Motors are frequently near-circular filled symbols with high solidity
-	# Improved thresholds for motor detection
-	if circularity >= 0.55 and solidity >= 0.55 and area >= 180:
-		confidence = min(0.85, (circularity + solidity) / 2.0)
+	# 1. Explicit geometry-based checks for motors and pumps
+	# Motors: typically perfect circles, moderate area
+	if 0.85 <= circularity <= 1.0 and 8 <= vertex_count <= 16 and area >= 100:
+		confidence = min(0.9, 0.5 + (0.4 * circularity))
 		return "motor", nearby_text or "Motor", confidence
 
-	# Tanks are larger vessels — use image-relative threshold to handle small images
+	# Pumps: often circular main body with a small attached triangle/polygon, leading to slightly lower circularity but high solidity.
+	if 0.50 <= circularity <= 0.88 and 0.80 <= solidity <= 1.0 and 5 <= vertex_count <= 14 and area >= 150:
+		confidence = min(0.85, 0.4 + (0.3 * circularity) + (0.2 * solidity))
+		return "pump", nearby_text or "Pump", confidence
+
+	# 2. Tanks are larger vessels — evaluate before valves to prevent large rectangles from being classified as valves
 	tank_threshold = 100
 	if image_area is not None:
+		# Require tank to be at least 0.05% of the entire image
 		tank_threshold = max(tank_threshold, int(image_area * 0.0005))
 	if area >= tank_threshold and 0.15 <= aspect_ratio <= 6.0 and extent >= 0.12:
+		# If the shape is large, heavily penalize it for being classified as a valve later
 		confidence = min(0.85, extent + 0.1)
 		return "tank", nearby_text or "Tank", confidence
 
+	# 3. Heuristic checks for Valves (usually small, bow-tie/diamond)
+	if valve_like_geometry and area <= 20000:
+		# Confidence boosted if aspect ratio is close to 1.0 (square-ish footprint)
+		confidence = min(0.85, 0.5 + (0.3 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0))))
+		return "valve", nearby_text or "Valve", confidence
+
+	# 4. Fallback pump check: less strict, handles irregular pump shapes.
+	if 0.3 <= circularity <= 0.95 and 0.5 <= solidity <= 1.0 and 4 <= vertex_count <= 20 and area >= 200:
+		confidence = min(0.75, 0.3 + (0.4 * circularity))
+		return "pump", nearby_text or "Pump", confidence
 	return None, nearby_text, confidence
 
 
@@ -627,8 +691,8 @@ def detect_shape_components(
 	contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 	candidates: list[dict[str, Any]] = []
 	
-	# Limit number of contours to process for performance
-	max_contours = int(os.getenv("SHAPE_DETECT_MAX_CONTOURS", "1000"))
+	# Limit number of contours to process and filter by area
+	max_contours = int(os.getenv("SHAPE_DETECT_MAX_CONTOURS", "500"))
 	if len(contours) > max_contours:
 		contours = sorted(contours, key=cv2.contourArea, reverse=True)[:max_contours]
 
@@ -636,8 +700,8 @@ def detect_shape_components(
 		area_small = float(cv2.contourArea(contour))
 		# convert area back to original image scale
 		area = area_small / (scale * scale) if scale > 0 and scale < 1.0 else area_small
-		# More permissive area threshold to catch smaller components and hollow tanks
-		min_area = max(float(OCR_MIN_COMPONENT_AREA), image_area * 0.00002)
+		# Conservative area threshold to avoid detecting noise but catch actual components
+		min_area = max(float(OCR_MIN_COMPONENT_AREA), image_area * 0.0002)
 		if area < min_area:
 			continue
 		x_s, y_s, width_s, height_s = cv2.boundingRect(contour)
@@ -649,10 +713,10 @@ def detect_shape_components(
 			height = int(height_s / scale)
 		else:
 			x, y, width, height = x_s, y_s, width_s, height_s
-		if width < 6 or height < 6:
+		if width < 10 or height < 10:
 			continue
 		aspect_ratio = width / max(height, 1)
-		if aspect_ratio > 15.0 or aspect_ratio < 0.07:
+		if aspect_ratio > 10.0 or aspect_ratio < 0.10:
 			continue
 		# Note: perimeter computed on small contour must be scaled as well; approximate using scaled bbox
 		perimeter = float(cv2.arcLength(contour, True))
@@ -685,8 +749,11 @@ def detect_shape_components(
 			continue
 		# Use the confidence from classification, but ensure minimum threshold
 		confidence = max(0.3, confidence)
-		# For valves, require higher confidence to avoid spurious small shapes
-		if category == "valve" and confidence < 0.45:
+		# For all categories, require reasonable confidence to avoid false positives
+		if confidence < 0.40:
+			continue
+		# For valves, require higher confidence
+		if category == "valve" and confidence < 0.50:
 			continue
 		candidates.append(
 			{
@@ -707,8 +774,8 @@ def detect_shape_components(
 	return candidates
 
 
-def dedupe_detections(detections: list[dict[str, Any]], iou_threshold: float = 0.5) -> list[dict[str, Any]]:
-	"""Remove duplicate detections using IoU. Increased threshold to reduce over-counting of nearby duplicates (valves)."""
+def dedupe_detections(detections: list[dict[str, Any]], iou_threshold: float = 0.3) -> list[dict[str, Any]]:
+	"""Remove duplicate detections using IoU. Lower threshold to be more aggressive in deduplication."""
 	ordered = sorted(detections, key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
 	kept: list[dict[str, Any]] = []
 	for candidate in ordered:
@@ -726,11 +793,12 @@ def dedupe_detections(detections: list[dict[str, Any]], iou_threshold: float = 0
 	return kept
 
 
-def merge_close_detections(detections: list[dict[str, Any]], distance_ratio: float = 1.2) -> list[dict[str, Any]]:
+def merge_close_detections(detections: list[dict[str, Any]], distance_ratio: float = 2.0) -> list[dict[str, Any]]:
 	"""Merge detections of the same category when their centers are very close.
 
 	This helps collapse a text label and a nearby shape that refer to the same component
 	but have little IoU overlap (common in P&ID diagrams).
+	Increased distance ratio to be more aggressive in merging nearby detections.
 	"""
 	if not detections:
 		return []
@@ -769,7 +837,10 @@ def build_counts(
 ) -> dict[str, int]:
 	merged = empty_counts()
 	for key in COUNT_KEYS:
-		merged[key] = max(ocr_counts.get(key, 0), visual_counts.get(key, 0))
+		# Use max of OCR and visual counts, but cap at reasonable limits
+		ocr_value = ocr_counts.get(key, 0)
+		visual_value = visual_counts.get(key, 0)
+		merged[key] = max(ocr_value, visual_value)
 	return merged
 
 
@@ -816,6 +887,50 @@ def parse_json_object(raw_text: str) -> dict[str, Any] | None:
 		except json.JSONDecodeError:
 			return None
 	return None
+
+
+def _apply_ollama_adjustments(text_blob: str, components: list[dict[str, Any]], ocr_counts: dict[str, int], industry_hint: str) -> list[dict[str, Any]]:
+    """Adjust component categories using Ollama verification.
+
+    Parameters
+    ----------
+    text_blob: OCR extracted text.
+    components: List of detected component dicts.
+    ocr_counts: OCR-derived counts (unused directly, kept for signature compatibility).
+    industry_hint: Industry string hint.
+
+    Returns
+    -------
+    List of possibly updated component dicts.
+    """
+    # Build current counts from components
+    current_counts = empty_counts()
+    for det in components:
+        cat = det.get("category")
+        if cat in current_counts:
+            current_counts[cat] += 1
+    # Run Ollama verification
+    ollama_result = verify_with_ollama(text_blob, current_counts, industry_hint)
+    if not ollama_result:
+        return components
+    adjusted_counts = ollama_result.get("counts", {})
+    # Adjust low‑confidence detections to match Ollama‑suggested counts
+    for cat, target in adjusted_counts.items():
+        if cat not in COUNT_KEYS:
+            continue
+        deficit = max(0, int(target) - current_counts.get(cat, 0))
+        if deficit <= 0:
+            continue
+        for det in components:
+            if deficit <= 0:
+                break
+            if det.get("confidence", 0) < 0.7 and det.get("category") != cat:
+                det["category"] = cat
+                det["name"] = cat.title()
+                det["confidence"] = max(det.get("confidence", 0), 0.75)
+                current_counts[cat] = current_counts.get(cat, 0) + 1
+                deficit -= 1
+    return components
 
 
 def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: str) -> dict[str, Any] | None:
@@ -1003,14 +1118,43 @@ async def analyze_pid_image_async(image: Image.Image) -> dict[str, Any]:
 	# Re-run shape detection with OCR data for better classification
 	shape_component_detections = detect_shape_components(image_array, ocr_detections)
 	ocr_component_detections, ocr_counts, industry = detect_text_driven_components(ocr_detections)
-	# Keep shape detections as the primary visual source for counts.
+	
+	# Combine shape and text-driven component detections
+	combined_components = shape_component_detections + ocr_component_detections
+	deduped_components = dedupe_detections(combined_components)
+	merged_components = merge_close_detections(deduped_components)
+	
+	# Apply Ollama verification & adjustment
+	if OLLAMA_USE_FOR_COUNTS:
+		merged_components = _apply_ollama_adjustments(text_blob, merged_components, ocr_counts, industry)
+
+	# Apply Active Learning model if available to override heuristics
+	try:
+		if __package__:
+			from . import active_learning
+		else:
+			import active_learning
+		scored_components = active_learning.predict_candidates(image_array, merged_components)
+		for candidate in scored_components:
+			predicted = candidate.get("predicted")
+			prob = float(candidate.get("prob", 0.0))
+			if predicted and prob >= 0.75:
+				candidate["category"] = predicted
+				if candidate.get("name", "").lower() in ("motor", "pump", "tank", "valve", "other"):
+					candidate["name"] = predicted.title()
+		merged_components = scored_components
+	except Exception as e:
+		logger.warning(f"Failed to apply active learning to candidates: {e}")
+
+	# Keep shape detections explicitly if needed by calling code, but visual_detections incorporates both
 	shape_detections = dedupe_detections(shape_component_detections)
-	visual_detections = shape_detections
+	visual_detections = merged_components
 
 	visual_counts = empty_counts()
 	for detection in visual_detections:
 		category = detection["category"]
-		conf = float(detection.get("confidence", 0.0))
+		# Text detections might not have visual confidence, so assume strong confidence if they were identified
+		conf = float(detection.get("confidence", 1.0))
 		# Only count visual detections that meet per-category confidence thresholds
 		if category in visual_counts and conf >= CONF_THRESH.get(category, 0.0):
 			visual_counts[category] += 1
@@ -1018,7 +1162,7 @@ async def analyze_pid_image_async(image: Image.Image) -> dict[str, Any]:
 	combined_counts = build_counts(ocr_counts, visual_counts)
 	coordinates_task = asyncio.to_thread(
 		detections_to_coordinates_payload,
-		dedupe_detections(text_detections + shape_detections),
+		dedupe_detections(text_detections + merged_components),
 	)
 	phi3_counts: dict[str, int] | None = None
 	phi3_industry: str | None = None
