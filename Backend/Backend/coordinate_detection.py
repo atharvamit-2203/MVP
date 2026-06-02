@@ -238,103 +238,10 @@ def detect_coordinates(
 	image: Image.Image,
 	config: dict[str, str],
 ) -> dict[str, Any]:
-	original_width, original_height = image.size
-	prepared_image, scale_x, scale_y = resize_for_model(image)
-	encoded_image = image_to_base64_png(prepared_image)
-	
-	payload = {
-		"model": config["qwen_model"],
-		"max_tokens": 4000,
-		"messages": [
-			{
-				"role": "system",
-				"content": "You are an expert at analyzing P&ID diagrams and detecting component positions with high precision.",
-			},
-			{
-				"role": "user",
-				"content": [
-					{"type": "text", "text": build_coordinate_detection_prompt()},
-					{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded_image}"}},
-				],
-			},
-		],
-		"temperature": 0.1,
-	}
-
-	headers = {
-		"Authorization": f"Bearer {config['api_key']}",
-		"Content-Type": "application/json",
-		"HTTP-Referer": config["site_url"],
-		"X-Title": config["app_name"],
-	}
-
-	try:
-		response = requests.post(
-			f"{config['base_url']}/chat/completions",
-			headers=headers,
-			json=payload,
-			timeout=180,
-		)
-		if response.status_code >= 400:
-			logger.error(f"OpenRouter model failed: {response.status_code} {response.text}")
-			raise ValueError(f"OpenRouter model failed: {response.status_code} {response.text}")
-		
-		response_json = response.json()
-		choices = response_json.get("choices") or []
-		if not choices:
-			logger.error("OpenRouter model returned no choices.")
-			raise ValueError("OpenRouter model returned no choices.")
-		
-		message = choices[0].get("message", {})
-		raw_content = extract_message_text(message)
-		
-		parsed = parse_json_payload(raw_content)
-		# Validate structure
-		if "root" not in parsed:
-			logger.error("Missing 'root' key in response")
-			raise ValueError("Missing 'root' key in response")
-		if "children" not in parsed["root"]:
-			logger.error("Missing 'children' key in root")
-			raise ValueError("Missing 'children' key in root")
-		
-		# Validate and scale coordinates
-		valid_children = []
-		for child in parsed["root"]["children"]:
-			if "position" not in child or "meta" not in child:
-				continue
-			
-			position = child["position"]
-			# Validate coordinates before scaling
-			if not validate_coordinates(position, prepared_image.width, prepared_image.height):
-				continue
-			
-			# Scale coordinates back to original image dimensions
-			scaled_position = scale_coordinates(position, scale_x, scale_y)
-			
-			# Validate scaled coordinates
-			if not validate_coordinates(scaled_position, original_width, original_height):
-				continue
-			
-			child["position"] = scaled_position
-			valid_children.append(child)
-		
-		parsed["root"]["children"] = valid_children
-		logger.info(f"Vision model detected {len(valid_children)} valid components")
-		return parsed
-		
-	except ValueError as exc:
-		logger.warning(f"Vision model detection failed: {exc}, returning empty structure")
-		# Return empty structure on failure
-		return {
-			"custom": {},
-			"params": {},
-			"props": {},
-			"root": {
-				"children": [],
-				"meta": {"name": "root"},
-				"type": "ia.container.coord",
-			},
+	# Vision model detection disabled - return empty structure to prevent discrepancy
+	logger.warning("Vision model detection disabled - returning empty structure")
+	return {
+		"root": {
+			"children": []
 		}
-	except Exception as exc:
-		logger.error(f"Unexpected error in detect_coordinates: {exc}")
-		raise
+	}

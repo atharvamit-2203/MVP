@@ -112,6 +112,15 @@ type PageDetectionResult = {
   model_results: ModelDetectionResult[]
 }
 
+type ComponentMatch = {
+  component_name: string
+  component_category: string | null
+  matched_library_image: string | null
+  matched_library_label: string | null
+  similarity_score: number
+  matches: boolean
+}
+
 type DetectionResponse = {
   filename: string
   content_type: string | null
@@ -121,6 +130,7 @@ type DetectionResponse = {
   pages: PageDetectionResult[]
   industry: string | null
   industry_warnings: { component: string[]; pid: string[] }
+  component_matches: ComponentMatch[]
 }
 
 type BatchAnalysisItem = {
@@ -255,6 +265,8 @@ function App() {
 
   const displayedDetectedComponents = batchRuns.length > 0 ? batchTotalDetectedComponents : totalDetectedComponents
   const displayedCoordinateCount = coordinates ? coordinates.root.children.length : 0
+  const selectedIndustryLabel = selectedIndustry.trim()
+  const detectedIndustryLabel = detection?.industry?.trim() || selectedIndustryLabel || 'Not selected'
 
   const supportsPreview = currentFile
     ? currentFile.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(currentFile.name)
@@ -799,7 +811,7 @@ function App() {
         <header className="topbar">
           <div className="topbar-left">
             <div className="eyebrow">
-              {detection?.industry ? `Industry: ${detection.industry}` : 'Stage 1 - Image Input'}
+              {detection ? `Industry: ${detectedIndustryLabel}` : 'Stage 1 - Image Input'}
             </div>
             <h1>P&ID Analysis Dashboard</h1>
             <p className="subtitle">Upload P&ID diagrams for AI-powered component detection and analysis</p>
@@ -1038,7 +1050,7 @@ function App() {
                   {!error && detection ? (
                     <div className="status success">
                       <span className="status-icon"><CheckIcon /></span>
-                      AI detection completed! Industry identified: {detection.industry || 'Unknown'}
+                      AI detection completed! Industry identified: {detectedIndustryLabel}
                     </div>
                   ) : null}
                   {!error && coordinates ? (
@@ -1063,7 +1075,7 @@ function App() {
                               <div className="frame-meta">
                                 <strong>{run.file.name}</strong>
                                 <span>{run.error ? `Error: ${run.error}` : 'Completed'}</span>
-                                <span>Industry: {run.detection?.industry || 'Unknown'}</span>
+                                <span>Industry: {run.detection?.industry || selectedIndustryLabel || 'Not selected'}</span>
                                 <span>
                                   {run.detection
                                     ? run.detection.pages.reduce((sum, page) => {
@@ -1186,7 +1198,7 @@ function App() {
             <>
               <section className="hero-panel compact-hero">
                 <p className="lede">
-                  Analysis results for {detection.filename} - Industry: {detection.industry || 'Unknown'}
+                  Analysis results for {detection.filename} - Industry: {detectedIndustryLabel}
                 </p>
               </section>
 
@@ -1195,11 +1207,11 @@ function App() {
                   <div className="card-header">
                     <div>
                       <div className="pill">Industry</div>
-                      <h2>{detection.industry || 'Unknown'}</h2>
+                      <h2>{detectedIndustryLabel}</h2>
                     </div>
                   </div>
                   <p className="industry-description">
-                    This P&ID diagram has been identified as belonging to the {detection.industry || 'Unknown'} industry.
+                    This P&ID diagram has been identified as belonging to the {detectedIndustryLabel} industry.
                     Component detection results are displayed below.
                   </p>
                 </article>
@@ -1229,29 +1241,50 @@ function App() {
                           </div>
                         </div>
 
-                        <div className="category-chips">
+                        <div className="count-grid">
                           {(['motor', 'pump', 'tank', 'valve'] as const).map((category) => {
                             const count = page.counts[category]
                             return (
-                              <span className="category-chip" key={category}>
-                                {category} {count}
-                              </span>
+                              <article className="count-card" key={category}>
+                                <span>{category}</span>
+                                <strong>{count}</strong>
+                              </article>
                             )
                           })}
                         </div>
+                      </article>
+                    ))}
 
-                        <div className="count-grid">
-                          {(['motor', 'pump', 'tank', 'valve'] as const).map((category) => (
-                            <div className="count-card" key={category}>
-                              <span>{category}</span>
-                              <strong>{page.counts[category]}</strong>
+                    {detection.component_matches && detection.component_matches.length > 0 && (
+                      <article className="result-card wide">
+                        <div className="card-header">
+                          <div>
+                            <div className="pill">Component Matching</div>
+                            <h2>Library Matches</h2>
+                          </div>
+                        </div>
+
+                        <div className="component-matches-grid">
+                          {detection.component_matches.map((match, index) => (
+                            <div className={`component-match-card ${match.matches ? 'matched' : 'unmatched'}`} key={index}>
+                              <div className="match-header">
+                                <strong>{match.component_name}</strong>
+                                <span className={`match-badge ${match.matches ? 'success' : 'warning'}`}>
+                                  {match.matches ? '✓ Match' : '✗ No Match'}
+                                </span>
+                              </div>
+                              <div className="match-details">
+                                <div><span>Category</span><strong>{match.component_category || 'Unknown'}</strong></div>
+                                <div><span>Similarity</span><strong>{(match.similarity_score * 100).toFixed(1)}%</strong></div>
+                                {match.matched_library_label && (
+                                  <div><span>Matched to</span><strong>{match.matched_library_label}</strong></div>
+                                )}
+                              </div>
                             </div>
                           ))}
                         </div>
-
-                        <div className="count-note">Verified by {page.model_results.map((result) => result.model).join(' + ')}</div>
                       </article>
-                    ))}
+                    )}
                   </div>
                 </section>
               </section>
@@ -1297,7 +1330,7 @@ function App() {
                           <div className="frame-card" key={run.file.name}>
                             <div className="frame-meta">
                               <strong>{run.file.name}</strong>
-                              <span>Industry: {run.detection?.industry || 'Unknown'}</span>
+                              <span>Industry: {run.detection?.industry || selectedIndustryLabel || 'Not selected'}</span>
                               <span>{visibleCount} visible coordinates</span>
                               <span>
                                 Components: {run.detection

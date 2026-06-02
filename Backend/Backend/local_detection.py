@@ -7,6 +7,7 @@ import os
 import random
 import re
 import json
+import time
 from pathlib import Path
 from functools import lru_cache
 from typing import Any
@@ -197,6 +198,7 @@ OCR_MIN_TEXT_CONFIDENCE = float(os.getenv("OCR_MIN_TEXT_CONFIDENCE", "0.15"))
 OCR_MIN_COMPONENT_AREA = int(os.getenv("OCR_MIN_COMPONENT_AREA", "50"))
 PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "en")
 PADDLEOCR_USE_GPU = os.getenv("PADDLEOCR_USE_GPU", "false").strip().lower() in {"1", "true", "yes", "on"}
+FAST_OCR_MAX_EDGE = max(768, int(os.getenv("FAST_OCR_MAX_EDGE", "1280")))
 # Re-enable Ollama with better error handling
 OLLAMA_ENABLED = os.getenv("OLLAMA_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
@@ -221,14 +223,22 @@ TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("TEMPLATE_MAX_PER_CATEGORY", "1
 TEMPLATE_MATCH_MAX_EDGE = max(640, int(os.getenv("TEMPLATE_MATCH_MAX_EDGE", "1920")))
 TEMPLATE_MAX_PEAKS = max(5, int(os.getenv("TEMPLATE_MAX_PEAKS", "50")))
 TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("TEMPLATE_MATCH_TIMEOUT_SECONDS", "30"))
+FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS", "12"))
+FAST_TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("FAST_TEMPLATE_MAX_PER_CATEGORY", "35")))
+FAST_TEMPLATE_MAX_TOTAL = max(4, int(os.getenv("FAST_TEMPLATE_MAX_TOTAL", "80")))
+FAST_MATCH_RELEVANT_ONLY = os.getenv("FAST_MATCH_RELEVANT_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"}
+FAST_DISABLE_ORB_OVER_TEMPLATE_COUNT = max(0, int(os.getenv("FAST_DISABLE_ORB_OVER_TEMPLATE_COUNT", "0")))
+FAST_OLLAMA_WAIT_CAP_SECONDS = float(os.getenv("FAST_OLLAMA_WAIT_CAP_SECONDS", "8"))
+FAST_ACCURACY_PRIORITIZE_OLLAMA = os.getenv("FAST_ACCURACY_PRIORITIZE_OLLAMA", "true").strip().lower() in {"1", "true", "yes", "on"}
+FAST_OLLAMA_TEXT_CHARS = max(800, int(os.getenv("FAST_OLLAMA_TEXT_CHARS", "2200")))
 
 # Minimum confidence required to count a visual detection for each category.
-# Expert-level: Very low thresholds for maximum recall
+# Expert-level: Very low thresholds for maximum recall - further lowered for better accuracy
 CONF_THRESH: dict[str, float] = {
-	"motor": 0.25,
-	"pump": 0.35,
-	"tank": 0.25,
-	"valve": 0.30,
+	"motor": 0.15,
+	"pump": 0.20,
+	"tank": 0.15,
+	"valve": 0.18,
 }
 
 
@@ -267,27 +277,41 @@ def prepare_ocr_image(image_array: np.ndarray, fast_mode: bool = False) -> np.nd
 	h, w = image_array.shape[:2]
 	max_edge = max(h, w)
 	prepared = image_array
-	target_edge = 2000 if fast_mode else 3200
+	target_edge = FAST_OCR_MAX_EDGE if fast_mode else 3200
 	if max_edge < target_edge:
 		scale = float(target_edge) / max_edge
 		prepared = cv2.resize(image_array, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+	elif fast_mode and max_edge > target_edge:
+		scale = float(target_edge) / max_edge
+		prepared = cv2.resize(image_array, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 	gray = cv2.cvtColor(prepared, cv2.COLOR_RGB2GRAY)
 	
-	# Denoise for bad quality images - very aggressive
-	gray = cv2.fastNlMeansDenoising(gray, h=5)
+	# Keep fast_mode cheap: skip heavy denoising and morphology passes.
+	if not fast_mode:
+		gray = cv2.fastNlMeansDenoising(gray, h=5)
 	
 	# Expert-level: Very high CLAHE clip limit for maximum contrast
-	clahe = cv2.createCLAHE(clipLimit=4.5, tileGridSize=(6, 6))
+	clahe = cv2.createCLAHE(
+		clipLimit=(2.2 if fast_mode else 4.5),
+		tileGridSize=((8, 8) if fast_mode else (6, 6)),
+	)
 	boosted = clahe.apply(gray)
 	
-	# Morphological operations to enhance text strokes - stronger
-	kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-	boosted = cv2.morphologyEx(boosted, cv2.MORPH_CLOSE, kernel)
-	boosted = cv2.morphologyEx(boosted, cv2.MORPH_OPEN, kernel)
+	if not fast_mode:
+		# Morphological operations to enhance text strokes - stronger
+		kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+		boosted = cv2.morphologyEx(boosted, cv2.MORPH_CLOSE, kernel)
+		boosted = cv2.morphologyEx(boosted, cv2.MORPH_OPEN, kernel)
 	
 	# Unsharp masking for clearer text - very strong enhancement
-	gaussian = cv2.GaussianBlur(boosted, (0, 0), 1.2)
-	sharpened = cv2.addWeighted(boosted, 2.2, gaussian, -1.2, 0)
+	gaussian = cv2.GaussianBlur(boosted, (0, 0), (0.8 if fast_mode else 1.2))
+	sharpened = cv2.addWeighted(
+		boosted,
+		(1.5 if fast_mode else 2.2),
+		gaussian,
+		(-0.5 if fast_mode else -1.2),
+		0,
+	)
 	
 	# Additional contrast boost
 	sharpened = cv2.normalize(sharpened, None, 0, 255, cv2.NORM_MINMAX)
@@ -378,8 +402,16 @@ def _prefer_fast_ollama_models(models: list[str]) -> list[str]:
 	return sorted(models, key=_score, reverse=True)
 
 
-def run_ocr(engine: Any, image_array: np.ndarray) -> Any:
+def run_ocr(engine: Any, image_array: np.ndarray, fast_mode: bool = False) -> Any:
 	"""Run OCR using the active OCR engine."""
+	if fast_mode:
+		return engine.readtext(
+			image_array,
+			decoder="greedy",
+			beamWidth=1,
+			paragraph=False,
+			batch_size=1,
+		)
 	return engine.readtext(image_array)
 
 
@@ -472,14 +504,14 @@ def merge_candidates(*candidate_groups: list[tuple[Any, str, float]]) -> list[tu
 def extract_ocr_detections(image_array: np.ndarray, fast_mode: bool = False) -> list[dict[str, Any]]:
 	engine = get_ocr_engine()
 	primary_image = prepare_ocr_image(image_array, fast_mode=fast_mode)
-	primary_raw = run_ocr(engine, primary_image)
+	primary_raw = run_ocr(engine, primary_image, fast_mode=fast_mode)
 	primary_candidates = flatten_ocr_result(primary_raw)
 	secondary_candidates: list[tuple[Any, str, float]] = []
 	if not fast_mode:
 		# A second pass on inverted contrast often recovers faint tags and small valve labels.
 		inverted = 255 - primary_image
 		try:
-			secondary_raw = run_ocr(engine, inverted)
+			secondary_raw = run_ocr(engine, inverted, fast_mode=fast_mode)
 			secondary_candidates = flatten_ocr_result(secondary_raw)
 		except Exception:
 			secondary_candidates = []
@@ -689,13 +721,13 @@ def _is_tank_like_geometry(
 	Expert-level: Much more permissive thresholds to catch all tank/vessel variants."""
 	if area < _min_tank_area(image_area):
 		return False
-	min_fraction = 0.0005 if image_area is not None else 0.0
-	if image_area is not None and area < max(250.0, image_area * min_fraction):
+	min_fraction = 0.0003 if image_area is not None else 0.0
+	if image_area is not None and area < max(200.0, image_area * min_fraction):
 		return False
 	eff_aspect = _effective_aspect_ratio(aspect_ratio)
-	if eff_aspect < 1.01 or eff_aspect > 25.0:
+	if eff_aspect < 1.0 or eff_aspect > 30.0:
 		return False
-	if extent < 0.08 or solidity < 0.22:
+	if extent < 0.06 or solidity < 0.18:
 		return False
 	return True
 
@@ -711,21 +743,21 @@ def _is_horizontal_vessel_geometry(
 ) -> bool:
 	"""Horizontal feed-line drums (wide, medium-large rectangles — not pipe segments).
 	Expert-level: Much more permissive thresholds to catch all drum variants."""
-	if image_area is not None and area > image_area * 0.035:
+	if image_area is not None and area > image_area * 0.040:
 		return False
-	min_area = 550.0
+	min_area = 450.0
 	if image_area is not None:
-		min_area = max(min_area, image_area * 0.0008)
-	if area < min_area or area > 2200.0:
+		min_area = max(min_area, image_area * 0.0006)
+	if area < min_area or area > 2500.0:
 		return False
 	eff_aspect = _effective_aspect_ratio(aspect_ratio)
-	if eff_aspect < 3.0 or eff_aspect > 10.0:
+	if eff_aspect < 2.5 or eff_aspect > 12.0:
 		return False
-	if extent < 0.32 or solidity < 0.42:
+	if extent < 0.28 or solidity < 0.38:
 		return False
 	if bbox is not None and image_height is not None and image_height > 0:
 		center_y = bbox[1] + bbox[3] / 2.0
-		if center_y > image_height * 0.68:
+		if center_y > image_height * 0.72:
 			return False
 	return True
 
@@ -740,21 +772,21 @@ def _is_circular_vessel_geometry(
 ) -> bool:
 	"""Circular vessels and round tanks (spherical tanks, storage spheres).
 	Expert-level: Detect circular tank shapes that may be missed by rectangular tank detection."""
-	if area < 400.0:
+	if area < 300.0:
 		return False
-	if image_area is not None and area > image_area * 0.020:
+	if image_area is not None and area > image_area * 0.025:
 		return False
-	min_fraction = 0.0006 if image_area is not None else 0.0
-	if image_area is not None and area < max(350.0, image_area * min_fraction):
+	min_fraction = 0.0004 if image_area is not None else 0.0
+	if image_area is not None and area < max(250.0, image_area * min_fraction):
 		return False
 	eff_aspect = _effective_aspect_ratio(aspect_ratio)
 	# Circular vessels should have aspect ratio close to 1.0
-	if eff_aspect < 0.85 or eff_aspect > 1.18:
+	if eff_aspect < 0.80 or eff_aspect > 1.25:
 		return False
 	# High circularity for round shapes
-	if circularity < 0.65:
+	if circularity < 0.58:
 		return False
-	if extent < 0.55 or solidity < 0.65:
+	if extent < 0.48 or solidity < 0.58:
 		return False
 	return True
 
@@ -856,16 +888,16 @@ def _is_compact_bowtie_valve(
 	):
 		return False
 	eff_aspect = _effective_aspect_ratio(aspect_ratio)
-	if eff_aspect > 2.0:
+	if eff_aspect > 2.5:
 		return False
-	if area < 40.0:
+	if area < 30.0:
 		return False
-	max_area = 300.0
+	max_area = 400.0
 	if image_area is not None:
-		max_area = min(max_area, image_area * 0.0005)
+		max_area = min(max_area, image_area * 0.0007)
 	if area > max_area:
 		return False
-	if circularity > 0.65:
+	if circularity > 0.70:
 		return False
 	return True
 
@@ -889,25 +921,25 @@ def _is_valve_like_geometry(
 		return False
 	if bbox is not None and image_area is not None:
 		_bw, _bh = bbox[2], bbox[3]
-		if _bw * _bh > image_area * 0.015:
+		if _bw * _bh > image_area * 0.018:
 			return False
-		max_symbol = math.sqrt(image_area) * 0.25
+		max_symbol = math.sqrt(image_area) * 0.28
 		if max(_bw, _bh) > max_symbol:
 			return False
 	# Expert-level: Wider vertex count range for various valve shapes
-	if not (3 <= vertex_count <= 20):
+	if not (3 <= vertex_count <= 25):
 		return False
 	# Expert-level: Wider aspect ratio range
-	if not (0.20 <= aspect_ratio <= 4.0):
+	if not (0.15 <= aspect_ratio <= 5.0):
 		return False
 	# Expert-level: Wider circularity range
-	if not (0.02 <= circularity <= 0.92):
+	if not (0.01 <= circularity <= 0.95):
 		return False
 	# Expert-level: Wider extent range
-	if not (0.05 <= extent <= 0.98):
+	if not (0.04 <= extent <= 0.99):
 		return False
 	# Expert-level: More permissive solidity threshold
-	if solidity > 0.88:
+	if solidity > 0.92:
 		return False
 	return True
 
@@ -1078,19 +1110,19 @@ def classify_visual_candidate(
 			)
 			return "valve", nearby_text or "Valve", confidence
 
-	# Motors: typically perfect circles, moderate area
-	if 0.80 <= circularity <= 1.0 and 6 <= vertex_count <= 20 and area >= 100 and solidity >= 0.75:
+	# Motors: typically perfect circles, moderate area - more permissive thresholds
+	if 0.75 <= circularity <= 1.0 and 5 <= vertex_count <= 25 and area >= 80 and solidity >= 0.68:
 		confidence = min(0.85, 0.45 + (0.35 * circularity))
 		return "motor", nearby_text or "Motor", confidence
 
-	# Pumps: require an on-sheet pump tag nearby (not a "From P-201" line label).
+	# Pumps: require an on-sheet pump tag nearby (not a "From P-201" line label) - more permissive thresholds
 	pump_tag_nearby = bool(_PUMP_TAG_RE.search(nearby_blob)) and not is_off_page_equipment_reference(nearby_blob)
 	if (
 		pump_tag_nearby
-		and 0.55 <= circularity <= 0.95
-		and 0.70 <= solidity <= 1.0
-		and 5 <= vertex_count <= 15
-		and area >= 120
+		and 0.50 <= circularity <= 0.98
+		and 0.65 <= solidity <= 1.0
+		and 4 <= vertex_count <= 18
+		and area >= 90
 	):
 		confidence = min(0.80, 0.35 + (0.30 * circularity) + (0.15 * solidity))
 		return "pump", nearby_text or "Pump", confidence
@@ -1103,8 +1135,8 @@ def detect_shape_components(
 	ocr_detections: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
 	# Downscale for faster contour detection, then rescale coordinates back to original.
-	# Expert-level: Higher resolution for better small component detection
-	max_edge = int(os.getenv("SHAPE_DETECT_MAX_EDGE", "1536"))
+	# Expert-level: Higher resolution for better small component detection - increased for better accuracy
+	max_edge = int(os.getenv("SHAPE_DETECT_MAX_EDGE", "2048"))
 	orig_h, orig_w = image_array.shape[0], image_array.shape[1]
 	image_area = orig_h * orig_w
 	scale = 1.0
@@ -1121,8 +1153,8 @@ def detect_shape_components(
 	contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 	candidates: list[dict[str, Any]] = []
 	
-	# Expert-level: Process more contours for better coverage
-	max_contours = int(os.getenv("SHAPE_DETECT_MAX_CONTOURS", "2000"))
+	# Expert-level: Process more contours for better coverage - increased for better accuracy
+	max_contours = int(os.getenv("SHAPE_DETECT_MAX_CONTOURS", "3000"))
 	if len(contours) > max_contours:
 		contours = sorted(contours, key=cv2.contourArea, reverse=True)[:max_contours]
 
@@ -1130,8 +1162,8 @@ def detect_shape_components(
 		area_small = float(cv2.contourArea(contour))
 		# convert area back to original image scale
 		area = area_small / (scale * scale) if scale > 0 and scale < 1.0 else area_small
-		# Maximum sensitivity: Very low minimum area to catch all components
-		min_area = max(10.0, image_area * 0.00001)
+		# Maximum sensitivity: Very low minimum area to catch all components - lowered for better recall
+		min_area = max(5.0, image_area * 0.000005)
 		if area < min_area:
 			continue
 		x_s, y_s, width_s, height_s = cv2.boundingRect(contour)
@@ -1179,9 +1211,9 @@ def detect_shape_components(
 		if category is None:
 			continue
 		# Use the confidence from classification, but ensure minimum threshold
-		confidence = max(0.25, confidence)
+		confidence = max(0.15, confidence)
 		# Use category-specific confidence thresholds from CONF_THRESH
-		min_conf = CONF_THRESH.get(category, 0.50)
+		min_conf = CONF_THRESH.get(category, 0.20)
 		if confidence < min_conf:
 			continue
 		# Filter out tiny valve-like detections that sit on the image top edge (likely annotation marks)
@@ -1734,6 +1766,31 @@ def count_detections_by_category(
 		if conf >= thresh.get(category, 0.45):
 			counts[category] += 1
 	return counts
+
+
+def select_relevant_template_categories(
+	shape_detections: list[dict[str, Any]],
+	ocr_counts: dict[str, int],
+	text_counts: dict[str, int],
+) -> list[str]:
+	"""Prioritize categories with on-page evidence for fast template matching."""
+	score: dict[str, int] = {key: 0 for key in COUNT_KEYS}
+	for key in COUNT_KEYS:
+		score[key] += int(ocr_counts.get(key, 0) or 0) * 3
+		score[key] += int(text_counts.get(key, 0) or 0) * 2
+	shape_counts = count_detections_by_category(shape_detections, thresholds={k: 0.0 for k in COUNT_KEYS})
+	for key in COUNT_KEYS:
+		score[key] += int(shape_counts.get(key, 0) or 0)
+
+	ranked = sorted(COUNT_KEYS, key=lambda key: score[key], reverse=True)
+	positive = [key for key in ranked if score[key] > 0]
+	# Keep at least two categories to avoid over-pruning edge cases.
+	if len(positive) >= 2:
+		return positive[:3]
+	if len(positive) == 1:
+		return [positive[0], ranked[1]]
+	# No evidence detected: fall back to all categories.
+	return list(COUNT_KEYS)
 
 
 @lru_cache(maxsize=1)
@@ -2708,6 +2765,7 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 		return None
 
 	token_summary = json.dumps(text_counts)
+	text_for_prompt = text_blob[:FAST_OLLAMA_TEXT_CHARS] if fast_mode else text_blob[:4000]
 	prompt = (
 		"You are an expert P&ID component counter.\n"
 		"Count ONLY physical equipment symbols drawn on this sheet: motors, pumps, tanks/vessels/drums, and valves "
@@ -2719,7 +2777,7 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 		f"OpenCV/template detection counts (may be wrong): {json.dumps(counts)}\n"
 		f"OCR token counts from tags: {token_summary}\n"
 		f"Industry hint: {industry_hint}\n"
-		f"OCR text from diagram:\n{text_blob[:4000]}\n"
+		f"OCR text from diagram:\n{text_for_prompt}\n"
 	)
 
 	env_models = [m.strip() for m in OLLAMA_MODELS.split(",") if m.strip()]
@@ -2761,14 +2819,16 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 	# Helper to query a single model (used with ThreadPoolExecutor)
 	def _query_model(model_name: str) -> tuple[str, str, dict | None, str | None]:
 		last_error: str | None = None
-		max_attempts = 2 if fast_mode else 3
+		# In fast_mode, one bounded attempt is more reliable than multiple retries
+		# that can overrun the global Ollama wait budget.
+		max_attempts = 1 if fast_mode else 3
 		for attempt in range(max_attempts):
 			payload = {
 				"model": model_name,
 				"prompt": prompt,
 				"stream": False,
 				"format": response_schema,
-				"options": {"temperature": 0, "num_predict": 128},
+				"options": {"temperature": 0, "num_predict": 64 if fast_mode else 128},
 			}
 			try:
 				timeout_sec = OLLAMA_FAST_TIMEOUT_SECONDS if fast_mode else OLLAMA_TIMEOUT_SECONDS
@@ -2865,6 +2925,12 @@ def detections_to_coordinates_payload(detections: list[dict[str, Any]]) -> dict[
 	children: list[dict[str, Any]] = []
 	for detection in sorted(detections, key=lambda item: (item["bbox"][1], item["bbox"][0])):
 		x, y, width, height = detection["bbox"]
+		# Some matchers (notably ORB+homography) can produce negative coordinates.
+		# Pydantic requires x/y/width/height to be >= 0.
+		x = int(max(0, x))
+		y = int(max(0, y))
+		width = int(max(0, width))
+		height = int(max(0, height))
 		children.append(
 			{
 				"meta": {"name": detection["name"]},
@@ -3003,11 +3069,21 @@ def _apply_active_learning_labels(
 		text_supports_valve = bool(
 			_VALVE_TAG_RE.search(nearby_blob)
 		)
+		text_supports_motor = any(
+			pattern.search(nearby_blob) for pattern in _COUNTABLE_TEXT_PATTERNS.get("motor", ())
+		)
+		misclass_prone_switch = (
+			predicted == "motor"
+			and current_category in {"valve", "pump"}
+		)
 
 		if predicted and (
 			prob >= threshold
 			or (predicted == "valve" and text_supports_valve and prob >= 0.40)
 		):
+			# Prevent common false relabels (valve/pump -> motor) unless very strong.
+			if misclass_prone_switch and not (text_supports_motor or prob >= 0.85):
+				continue
 			candidate["category"] = predicted
 			candidate["confidence"] = max(float(candidate.get("confidence", 0.0) or 0.0), prob)
 			if str(candidate.get("name", "")).lower() in ("motor", "pump", "tank", "valve", "other"):
@@ -3021,6 +3097,12 @@ async def analyze_pid_image_async(
 	fast_mode: bool = False,
 	use_component_library: bool = False,
 ) -> dict[str, Any]:
+	start_time = time.perf_counter()
+	stage_times: dict[str, float] = {}
+
+	def mark_stage(stage_name: str, stage_start: float) -> None:
+		stage_times[stage_name] = time.perf_counter() - stage_start
+
 	image_array = np.array(image.convert("RGB"))
 
 	# If the user library is enabled, templates may have just changed (new uploads).
@@ -3035,6 +3117,7 @@ async def analyze_pid_image_async(
 		ocr_task = asyncio.create_task(asyncio.to_thread(extract_ocr_detections, image_array, fast_mode))
 
 	
+	ocr_stage_start = time.perf_counter()
 	try:
 		ocr_detections = await ocr_task
 	except Exception:
@@ -3042,14 +3125,20 @@ async def analyze_pid_image_async(
 			ocr_task.cancel()
 		await asyncio.gather(ocr_task, return_exceptions=True)
 		raise
+	mark_stage("ocr", ocr_stage_start)
 	
 	text_blob = " ".join(detection.get("text", "") for detection in ocr_detections).strip()
 	text_counts = extract_counts_from_text(text_blob)
-	
-	# Run shape detection with OCR context for better classification
+
+	# Text-driven detection and counts (needed for template category selection).
+	ocr_component_detections, ocr_counts, industry = detect_text_driven_components(ocr_detections)
+
+	# Run shape detection with OCR context for better classification.
+	shape_stage_start = time.perf_counter()
 	shape_component_detections = await asyncio.to_thread(detect_shape_components, image_array, ocr_detections)
+	mark_stage("shape_detection", shape_stage_start)
 	logger.info(f"Shape detection found {len(shape_component_detections)} components")
-	
+
 	# Template-match uploaded component reference photos (annotations folder).
 	# Always run template matching for expert-level accuracy using annotation images
 	template_detections: list[dict[str, Any]] = []
@@ -3058,64 +3147,139 @@ async def analyze_pid_image_async(
 	ssim_detections: list[dict[str, Any]] = []
 	template_count = 0
 	templates = load_annotation_templates()
+	if fast_mode and templates:
+		# Keep fast mode under budget by limiting per-category template volume.
+		templates = {
+			category: refs[:FAST_TEMPLATE_MAX_PER_CATEGORY]
+			for category, refs in templates.items()
+		}
 	templates_available = bool(templates)
 	if templates_available:
 		# Use full template set (all categories) with expert-level thresholds
+		template_stage_start = time.perf_counter()
 		try:
 			template_threshold = 0.45  # Lowered threshold for maximum template matching accuracy
+			if fast_mode and FAST_MATCH_RELEVANT_ONLY:
+				relevant_categories = select_relevant_template_categories(
+					shape_component_detections,
+					ocr_counts,
+					text_counts,
+				)
+				templates = {
+					category: templates.get(category, [])
+					for category in relevant_categories
+					if templates.get(category)
+				}
+
+			# Enforce a global template budget in fast mode.
+			if fast_mode:
+				total_refs = sum(len(v) for v in templates.values())
+				if total_refs > FAST_TEMPLATE_MAX_TOTAL and templates:
+					categories = list(templates.keys())
+					per_category = max(1, FAST_TEMPLATE_MAX_TOTAL // max(1, len(categories)))
+					templates = {
+						category: refs[:per_category]
+						for category, refs in templates.items()
+					}
 			template_count = sum(len(v) for v in templates.values())
 			
 			# Expert-level: Lower threshold specifically for tank templates to improve tank detection
 			tank_templates = {k: v for k, v in templates.items() if k == "tank"}
 			other_templates = {k: v for k, v in templates.items() if k != "tank"}
 			
-			# Run template matching, feature matching, and edge matching in parallel
-			template_task = asyncio.to_thread(
+			# In fast mode keep only high value matchers; edge+SSIM are expensive.
+			use_edge_matching = not fast_mode
+			use_ssim_matching = not fast_mode
+			extended_scales = not fast_mode
+			feature_min_matches = 9 if fast_mode else 8
+
+			# Run matching tasks in parallel.
+			template_task = asyncio.create_task(asyncio.to_thread(
 				match_annotation_templates,
 				image_array,
 				other_templates,
 				template_threshold,
-				extended_scales=True,  # Always use extended scales for expert accuracy
-			)
+				extended_scales=extended_scales,
+			))
 			
 			# Separate task for tank templates with lower threshold
-			tank_template_task = asyncio.to_thread(
+			tank_template_task = asyncio.create_task(asyncio.to_thread(
 				match_annotation_templates,
 				image_array,
 				tank_templates,
 				0.40,  # Even lower threshold for tanks to improve recall
-				extended_scales=True,
-			)
+				extended_scales=extended_scales,
+			))
 			
-			feature_task = asyncio.to_thread(
-				match_features_with_orb,
-				image_array,
-				templates,
-				min_matches=8,
-				extended_scales=True,
+			disable_orb_fast = (
+				fast_mode
+				and FAST_DISABLE_ORB_OVER_TEMPLATE_COUNT > 0
+				and template_count >= FAST_DISABLE_ORB_OVER_TEMPLATE_COUNT
 			)
-			
-			edge_task = asyncio.to_thread(
-				match_edges_template,
-				image_array,
-				templates,
-				threshold=0.50,
-				extended_scales=True,
-			)
-			
-			# Expert-level: Add SSIM-based template matching for structural similarity
-			ssim_task = asyncio.to_thread(
-				match_with_ssim,
-				image_array,
-				templates,
-				threshold=0.55,
-				extended_scales=True,
-			)
-			
-			template_detections, tank_template_detections, feature_detections, edge_detections, ssim_detections = await asyncio.wait_for(
-				asyncio.gather(template_task, tank_template_task, feature_task, edge_task, ssim_task, return_exceptions=True),
-				timeout=TEMPLATE_MATCH_TIMEOUT_SECONDS,
-			)
+			task_keys = ["template", "tank_template"]
+			task_list = [template_task, tank_template_task]
+			if not disable_orb_fast:
+				feature_task = asyncio.create_task(asyncio.to_thread(
+					match_features_with_orb,
+					image_array,
+					templates,
+					min_matches=feature_min_matches,
+					extended_scales=extended_scales,
+				))
+				task_keys.append("feature")
+				task_list.append(feature_task)
+			else:
+				logger.info(
+					"Fast mode: skipping ORB feature matching for %s templates (threshold=%s)",
+					template_count,
+					FAST_DISABLE_ORB_OVER_TEMPLATE_COUNT,
+				)
+			if use_edge_matching:
+				task_keys.append("edge")
+				task_list.append(
+					asyncio.create_task(asyncio.to_thread(
+						match_edges_template,
+						image_array,
+						templates,
+						threshold=0.50,
+						extended_scales=True,
+					))
+				)
+			if use_ssim_matching:
+				task_keys.append("ssim")
+				task_list.append(
+					asyncio.create_task(asyncio.to_thread(
+						match_with_ssim,
+						image_array,
+						templates,
+						threshold=0.55,
+						extended_scales=True,
+					))
+				)
+
+			template_timeout = FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS if fast_mode else TEMPLATE_MATCH_TIMEOUT_SECONDS
+			done, pending = await asyncio.wait(task_list, timeout=template_timeout)
+			results_by_key: dict[str, Any] = {key: [] for key in task_keys}
+			for key, task in zip(task_keys, task_list, strict=False):
+				if task in done:
+					try:
+						results_by_key[key] = task.result()
+					except Exception as exc:
+						results_by_key[key] = exc
+				else:
+					task.cancel()
+			if pending:
+				await asyncio.gather(*pending, return_exceptions=True)
+				logger.warning(
+					"Template/feature/edge matching hit %.0fs timeout (%s templates); using completed matcher results only",
+					template_timeout,
+					template_count,
+				)
+			template_detections = results_by_key.get("template", [])
+			tank_template_detections = results_by_key.get("tank_template", [])
+			feature_detections = results_by_key.get("feature", [])
+			edge_detections = results_by_key.get("edge", [])
+			ssim_detections = results_by_key.get("ssim", [])
 			
 			# Handle exceptions from individual tasks
 			if isinstance(template_detections, Exception):
@@ -3146,22 +3310,11 @@ async def analyze_pid_image_async(
 				len(ssim_detections),
 				template_count,
 			)
-		except asyncio.TimeoutError:
-			logger.warning(
-				"Template/feature/edge matching timed out after %.0fs (%s templates); using shape detection only",
-				TEMPLATE_MATCH_TIMEOUT_SECONDS,
-				template_count,
-			)
-			template_detections = []
-			feature_detections = []
-			edge_detections = []
-			ssim_detections = []
+		finally:
+			mark_stage("template_pipeline", template_stage_start)
 	else:
 		logger.warning("No annotation templates available")
 		ssim_detections = []
-
-
-	ocr_component_detections, ocr_counts, industry = detect_text_driven_components(ocr_detections)
 
 	# Combine shape, text-driven, template matches, feature matches, edge matches, and any hand-drawn annotations
 	annotation_detections = get_annotation_detections_for_image(image)
@@ -3203,34 +3356,34 @@ async def analyze_pid_image_async(
 		bbox = det.get("bbox")
 		
 		# High confidence detections pass immediately
-		if confidence >= 0.75:
+		if confidence >= 0.60:
 			verified_components.append(det)
 			continue
 		
 		# Medium confidence detections need additional verification
-		if confidence >= 0.50 and bbox:
+		if confidence >= 0.35 and bbox:
 			area = float(det.get("area", 0))
 			aspect_ratio = float(det.get("aspect_ratio", 1.0))
 			
 			# Verify geometry matches category expectations
 			if category == "tank":
 				# Tanks should have reasonable area and aspect ratio
-				if area >= 200 and (aspect_ratio >= 1.2 or aspect_ratio <= 0.85):
+				if area >= 150 and (aspect_ratio >= 1.1 or aspect_ratio <= 0.90):
 					verified_components.append(det)
 			elif category == "valve":
 				# Valves should be compact
-				if area >= 50 and area <= 2000:
+				if area >= 30 and area <= 2500:
 					verified_components.append(det)
 			elif category in ["motor", "pump"]:
 				# Motors and pumps should have reasonable size
-				if area >= 100 and area <= 3000:
+				if area >= 80 and area <= 3500:
 					verified_components.append(det)
 			else:
 				# Unknown category, keep if reasonable confidence
-				if confidence >= 0.55:
+				if confidence >= 0.40:
 					verified_components.append(det)
 		# Low confidence detections are filtered out unless they have strong OCR support
-		elif confidence >= 0.40 and det.get("name", "").lower() in ["tank", "motor", "pump", "valve"]:
+		elif confidence >= 0.25 and det.get("name", "").lower() in ["tank", "motor", "pump", "valve"]:
 			verified_components.append(det)
 	
 	combined_components = verified_components
@@ -3264,7 +3417,8 @@ async def analyze_pid_image_async(
 		candidate_box: tuple[int, int, int, int],
 		evidence_box: tuple[int, int, int, int],
 		image_area: float,
-		) -> bool:
+	) -> bool:
+
 		cx1, cy1 = bbox_center(candidate_box)
 		cx2, cy2 = bbox_center(evidence_box)
 		# Use larger dimension as symbol “scale” proxy.
@@ -3281,6 +3435,8 @@ async def analyze_pid_image_async(
 		return dist <= max_dim * 1.25
 
 	# Promote candidates near template evidence (distance/size based).
+	# Improvement: require MULTI-evidence for promotion when OCR has no explicit valve tag.
+	# This substantially reduces false positives from isolated geometry matches.
 	if valve_templates:
 		template_boxes = [d.get("bbox") for d in valve_templates if d.get("bbox")]
 		if template_boxes:
@@ -3295,7 +3451,7 @@ async def analyze_pid_image_async(
 					continue
 
 				# Extra cue: if nearby OCR already contains a valve tag, allow
-				# promotion even if template overlap is low.
+				# promotion even if template evidence is weak.
 				nearby_text = ""
 				try:
 					# Slightly expanded box for cue extraction.
@@ -3305,34 +3461,51 @@ async def analyze_pid_image_async(
 					nearby_text = ""
 
 				nearby_has_valve_tag = bool(_VALVE_TAG_RE.search(nearby_text or ""))
-				# Geometry evidence (from our classifier).
-				candidate_valve_conf = float(det.get("confidence", 0.0) or 0.0)
 
-				# Check if near any template hit evidence.
+				# Count template evidence hits close to this candidate.
+				evidence_hits = 0
+				narrow_hits = 0
 				for tb in template_boxes:
 					if not tb:
 						continue
 					if _near_template_evidence(box, tb, image_area=image_area):
-						# Gate promotion: must have valve OCR tag nearby OR a tighter template proximity.
-						# Avoid permissive geometry-only promotion to prevent inflation.
-						if nearby_has_valve_tag:
-							det["category"] = "valve"
-							det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.82)
-							debug_refinement["promoted_valves"] += 1
-							break
-						else:
-							# Tight proximity requirement when there's no explicit valve tag.
-							# Use smaller threshold than _near_template_evidence to reduce false positives.
-							narrow_ok = _near_template_evidence(box, tb, image_area=image_area) and (
+						evidence_hits += 1
+						# Extra strict proximity when OCR tag is absent.
+						try:
+							narrow_ok = (
 								iou(box, tb) >= 0.06 or (
-									(math.hypot(*tuple(a-b for a,b in zip(bbox_center(box), bbox_center(tb)))) <= max(box[2], box[3], tb[2], tb[3]) * 0.75)
+									math.hypot(*tuple(a - b for a, b in zip(bbox_center(box), bbox_center(tb))))
+										<= max(box[2], box[3], tb[2], tb[3]) * 0.75
 								)
 							)
-							if narrow_ok:
-								det["category"] = "valve"
-								det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.82)
-								debug_refinement["promoted_valves"] += 1
-								break
+						except Exception:
+							narrow_ok = False
+						if narrow_ok:
+							narrow_hits += 1
+
+				# Promotion gating:
+				# - If we have explicit valve OCR tag nearby: require at least 1 evidence hit.
+				# - If NO valve OCR tag: require stronger multi-evidence (>=2 close hits)
+				#   OR at least 1 strict (narrow) hit.
+				if evidence_hits <= 0:
+					continue
+
+				if nearby_has_valve_tag:
+					# Allow with 1 close evidence hit.
+					if evidence_hits >= 1:
+						det["category"] = "valve"
+						det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.82)
+						debug_refinement["promoted_valves"] += 1
+						break
+				else:
+					# No explicit tag: require multi-hit evidence to prevent isolated false positives.
+					# Prefer narrow_hits (higher precision), but allow 2+ nearby hits as recall.
+					if (narrow_hits >= 1) or (evidence_hits >= 2):
+						det["category"] = "valve"
+						det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.82)
+						debug_refinement["promoted_valves"] += 1
+						break
+
 
 
 	def _candidate_is_compact_valve_like(det: dict[str, Any]) -> bool:
@@ -3437,21 +3610,21 @@ async def analyze_pid_image_async(
 			
 		if "prob" in _det:
 			# Suppress highly uncertain predictions from the Random Forest.
-			# 0.50 is a strong threshold for a 4-class RF model.
-			if prob < 0.50:
-				_det["confidence"] = min(float(_det.get("confidence", 1.0)), 0.4)
+			# Reduced threshold from 0.50 to 0.35 to avoid suppressing valid detections
+			if prob < 0.35:
+				_det["confidence"] = min(float(_det.get("confidence", 1.0)), 0.25)
 
 
 	# Single source of truth: build the exact set of components that will be used for:
 	# 1) counting
 	# 2) coordinates
 	# This removes the mismatch where coordinates used a slightly different filtered set.
+	# Include template-based detections for better accuracy
 	countable_components: list[dict[str, Any]] = [
 		det
 		for det in visual_detections
 		if det.get("category") in COUNT_KEYS
 		and float(det.get("confidence", 1.0)) >= active_thresh.get(det.get("category"), 0.0)
-		and det.get("source") != "template"
 	]
 
 	# Deterministic counting from countable_components (no re-filter later)
@@ -3471,6 +3644,7 @@ async def analyze_pid_image_async(
 	# Use the same countable component set for coordinates as used for counting.
 	filtered_for_coordinates = countable_components
 
+	coordinates_stage_start = time.perf_counter()
 	coordinates_task = asyncio.create_task(
 		asyncio.to_thread(
 			detections_to_coordinates_payload,
@@ -3484,7 +3658,13 @@ async def analyze_pid_image_async(
 	used_ollama = False
 	ollama_task: asyncio.Task[dict[str, Any] | None] | None = None
 	_disable_ollama = os.getenv("DISABLE_OLLAMA_VERIFICATION", "false").strip().lower() in {"1", "true", "yes", "on"}
-	if OLLAMA_ENABLED and OLLAMA_USE_FOR_COUNTS and not _disable_ollama:
+	elapsed_before_ollama = time.perf_counter() - start_time
+	should_run_ollama = (
+		OLLAMA_ENABLED
+		and OLLAMA_USE_FOR_COUNTS
+		and not _disable_ollama
+	)
+	if should_run_ollama:
 		ollama_task = asyncio.create_task(
 			asyncio.to_thread(
 				verify_with_ollama,
@@ -3500,8 +3680,18 @@ async def analyze_pid_image_async(
 		"""Wait for Ollama; on first timeout, keep waiting up to completion budget."""
 		if ollama_task is None:
 			return None
+		completion_wait = (
+			min(float(OLLAMA_COMPLETION_TIMEOUT_SECONDS), FAST_OLLAMA_WAIT_CAP_SECONDS)
+			if fast_mode
+			else float(OLLAMA_COMPLETION_TIMEOUT_SECONDS)
+		)
+		extra_wait = (
+			min(float(OLLAMA_FAST_TIMEOUT_SECONDS), max(0.0, FAST_OLLAMA_WAIT_CAP_SECONDS - completion_wait))
+			if fast_mode
+			else float(OLLAMA_FAST_TIMEOUT_SECONDS)
+		)
 		try:
-			return await asyncio.wait_for(asyncio.shield(ollama_task), timeout=OLLAMA_COMPLETION_TIMEOUT_SECONDS)
+			return await asyncio.wait_for(asyncio.shield(ollama_task), timeout=completion_wait)
 		except asyncio.TimeoutError:
 			if ollama_task.done():
 				try:
@@ -3511,15 +3701,30 @@ async def analyze_pid_image_async(
 					return None
 			logger.warning(
 				"Ollama still running after %ss — waiting up to %ss more for completion",
-				OLLAMA_COMPLETION_TIMEOUT_SECONDS,
-				OLLAMA_FAST_TIMEOUT_SECONDS,
+				completion_wait,
+				extra_wait,
 			)
+			if extra_wait <= 0:
+				if fast_mode and FAST_ACCURACY_PRIORITIZE_OLLAMA:
+					accuracy_wait = max(0.0, float(OLLAMA_COMPLETION_TIMEOUT_SECONDS) - completion_wait)
+					if accuracy_wait > 0:
+						logger.warning(
+							"Ollama exceeded fast wait cap; accuracy mode waiting %.1fs more",
+							accuracy_wait,
+						)
+						try:
+							return await asyncio.wait_for(asyncio.shield(ollama_task), timeout=accuracy_wait)
+						except asyncio.TimeoutError:
+							logger.error("Ollama accuracy wait expired; using OpenCV counts")
+							return None
+				logger.error("Ollama exceeded fast wait cap; using OpenCV counts")
+				return None
 			try:
-				return await asyncio.wait_for(asyncio.shield(ollama_task), timeout=float(OLLAMA_FAST_TIMEOUT_SECONDS))
+				return await asyncio.wait_for(asyncio.shield(ollama_task), timeout=extra_wait)
 			except asyncio.TimeoutError:
 				logger.error(
 					"Ollama did not finish within %ss total; using OpenCV counts",
-					OLLAMA_COMPLETION_TIMEOUT_SECONDS + OLLAMA_FAST_TIMEOUT_SECONDS,
+					completion_wait + extra_wait,
 				)
 				return None
 		except asyncio.CancelledError:
@@ -3543,36 +3748,92 @@ async def analyze_pid_image_async(
 			ollama_val = int(phi3_counts.get(key, 0) or 0)
 			current = int(combined_counts.get(key, 0))
 			visual_val = int(visual_counts.get(key, 0))
-			# Trust Ollama to correct over-counts; allow modest under-count fixes when vision found nothing.
+			# In fast_mode, keep CV/OCR detections authoritative.
+			# A single quick Ollama pass is useful for hints, but should never reduce
+			# deterministic counts because that causes avoidable under-count regressions.
+			if fast_mode:
+				text_val = int(text_counts.get(key, 0) or 0)
+				# Deterministic floor from existing CV/OCR stages.
+				deterministic_floor = max(current, text_val)
+				combined_counts[key] = deterministic_floor
+				# Allow upward correction only when vision saw none.
+				if visual_val == 0 and ollama_val > deterministic_floor:
+					combined_counts[key] = ollama_val
+				continue
+			# Non-fast mode: allow Ollama to correct over-counts and add missing classes.
 			if ollama_val < current:
 				combined_counts[key] = ollama_val
 			elif visual_val == 0 and ollama_val > current:
 				combined_counts[key] = ollama_val
 
+	def _rebalance_motor_valve_counts() -> None:
+		"""Fix common confusion where a weak motor candidate is actually a valve.
+
+		Only applies a single-step rebalance and only when text/OCR evidence
+		supports valve but not motor, to avoid broad behavior shifts.
+		"""
+		motor_count = int(combined_counts.get("motor", 0) or 0)
+		if motor_count <= 0:
+			return
+
+		motor_text = max(int(text_counts.get("motor", 0) or 0), int(ocr_counts.get("motor", 0) or 0))
+		valve_text = max(int(text_counts.get("valve", 0) or 0), int(ocr_counts.get("valve", 0) or 0))
+		if motor_text > 0 or valve_text <= int(combined_counts.get("valve", 0) or 0):
+			return
+
+		motor_candidates = [d for d in countable_components if d.get("category") == "motor"]
+		if not motor_candidates:
+			return
+
+		weakest_motor_conf = min(float(d.get("confidence", 0.0) or 0.0) for d in motor_candidates)
+		if weakest_motor_conf > 0.80:
+			return
+
+		combined_counts["motor"] = max(0, motor_count - 1)
+		combined_counts["valve"] = int(combined_counts.get("valve", 0) or 0) + 1
+		logger.info(
+			"Applied motor->valve rebalance (motor_text=%s valve_text=%s weakest_motor_conf=%.2f): %s",
+			motor_text,
+			valve_text,
+			weakest_motor_conf,
+			combined_counts,
+		)
+
 	if fast_mode:
 		if ollama_task is not None:
+			ollama_wait_stage_start = time.perf_counter()
 			try:
 				coordinates, phi3_result = await asyncio.gather(
 					coordinates_task,
 					_await_ollama_with_extension(),
 				)
+				mark_stage("coordinates", coordinates_stage_start)
+				mark_stage("ollama_wait", ollama_wait_stage_start)
 				_apply_ollama_counts(phi3_result)
+				_rebalance_motor_valve_counts()
 				if used_ollama:
 					logger.info("Ollama verification applied: %s", combined_counts)
 			except Exception as exc:
 				logger.warning("Ollama verification failed: %s", exc)
 				coordinates = await coordinates_task
+				mark_stage("coordinates", coordinates_stage_start)
 		else:
 			coordinates = await coordinates_task
+			mark_stage("coordinates", coordinates_stage_start)
 	elif ollama_task is None:
 		coordinates = await coordinates_task
+		mark_stage("coordinates", coordinates_stage_start)
 	else:
+		ollama_wait_stage_start = time.perf_counter()
 		try:
 			phi3_result, coordinates = await asyncio.gather(
 				_await_ollama_with_extension(),
 				coordinates_task,
 			)
+			mark_stage("coordinates", coordinates_stage_start)
+			mark_stage("ollama_wait", ollama_wait_stage_start)
 			_apply_ollama_counts(phi3_result)
+			_rebalance_motor_valve_counts()
 			if used_ollama:
 				logger.info("Ollama verification applied: %s", combined_counts)
 		except Exception:
@@ -3589,6 +3850,18 @@ async def analyze_pid_image_async(
 	if not coordinates_task.done():
 		coordinates_task.cancel()
 		await asyncio.gather(coordinates_task, return_exceptions=True)
+	total_elapsed = time.perf_counter() - start_time
+	logger.info(
+		"analyze_pid_image_async timing (fast_mode=%s): total=%.2fs ocr=%.2fs shape=%.2fs template=%.2fs coordinates=%.2fs ollama_wait=%.2fs pre_ollama=%.2fs",
+		fast_mode,
+		total_elapsed,
+		stage_times.get("ocr", 0.0),
+		stage_times.get("shape_detection", 0.0),
+		stage_times.get("template_pipeline", 0.0),
+		stage_times.get("coordinates", 0.0),
+		stage_times.get("ollama_wait", 0.0),
+		elapsed_before_ollama,
+	)
 	return {
 		"ocr_counts": ocr_counts,
 		"vision_counts": visual_counts,

@@ -5,6 +5,7 @@ import logging
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -49,6 +50,15 @@ LABEL_ALIASES = {
 
 _MODEL_CACHE: dict[str, Any] | None = None
 _MODEL_CACHE_MTIME_NS: int | None = None
+
+
+def _annotations_signature() -> tuple[int, int]:
+    """Return a stable signature for the annotations file so feature caches refresh on edits."""
+    path = ANNOTATIONS_DIR / "annotations.jsonl"
+    if not path.exists():
+        return (0, 0)
+    stat = path.stat()
+    return (int(stat.st_mtime_ns), int(stat.st_size))
 
 
 def _normalize_label(label: str) -> str | None:
@@ -173,7 +183,8 @@ def _extract_features_from_box(image_array: np.ndarray, bbox: Tuple[int, int, in
     return features
 
 
-def _load_annotation_lines() -> List[Dict[str, Any]]:
+@lru_cache(maxsize=2)
+def _load_annotation_lines_cached(signature: tuple[int, int]) -> List[Dict[str, Any]]:
     path = ANNOTATIONS_DIR / "annotations.jsonl"
     if not path.exists():
         return []
@@ -185,6 +196,43 @@ def _load_annotation_lines() -> List[Dict[str, Any]]:
             except Exception:
                 continue
     return out
+
+
+def _load_annotation_lines() -> List[Dict[str, Any]]:
+    return _load_annotation_lines_cached(_annotations_signature())
+
+
+@lru_cache(maxsize=2)
+def _build_library_feature_bank(signature: tuple[int, int]) -> Dict[str, List[Dict[str, Any]]]:
+    """Precompute library features once so per-component matching is fast."""
+    bank: Dict[str, List[Dict[str, Any]]] = {label: [] for label in TOP_LEVEL_LABELS}
+    anns = _load_annotation_lines_cached(signature)
+    for entry in anns:
+        image_name = entry.get("image")
+        image_path = ANNOTATIONS_DIR / image_name
+        if not image_name or not image_path.exists():
+            continue
+        img_bgr = cv2.imread(str(image_path))
+        if img_bgr is None:
+            continue
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        for ann in entry.get("annotations", []):
+            label = _normalize_label(ann.get("label", ""))
+            if label not in TOP_LEVEL_LABELS:
+                continue
+            bbox = ann.get("bbox", [0, 0, img.shape[1], img.shape[0]])
+            if len(bbox) != 4:
+                continue
+            x, y, w, h = bbox
+            bank[label].append(
+                {
+                    "image": image_name,
+                    "label": label,
+                    "bbox": bbox,
+                    "features": _extract_fast_features(img, (x, y, w, h)),
+                }
+            )
+    return bank
 
 
 def compute_feature_similarity(features1: Dict[str, Any], features2: Dict[str, Any]) -> float:
@@ -216,38 +264,22 @@ def match_component_to_library(
     top_k: int = 5
 ) -> List[Dict[str, Any]]:
     """Match a component against the component library based on visual features."""
-    anns = _load_annotation_lines()
     matches = []
-    
-    for entry in anns:
-        image_name = entry.get("image")
-        image_path = ANNOTATIONS_DIR / image_name
-        if not image_path.exists():
-            continue
-        
-        img = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
-        
-        for ann in entry.get("annotations", []):
-            label = _normalize_label(ann.get("label", ""))
-            if not label:
-                continue
-            
-            # If category is specified, only match same category
-            if component_category and label != component_category:
-                continue
-            
-            bbox = ann.get("bbox", [0, 0, img.shape[1], img.shape[0]])
-            if len(bbox) == 4:
-                x, y, w, h = bbox
-                lib_features = _extract_fast_features(img, (x, y, w, h))
-                similarity = compute_feature_similarity(component_features, lib_features)
-                
-                matches.append({
-                    "image": image_name,
-                    "label": label,
-                    "bbox": bbox,
-                    "similarity": similarity,
-                })
+
+    bank = _build_library_feature_bank(_annotations_signature())
+    categories = [component_category] if component_category in bank else list(bank.keys())
+    if component_category and component_category not in bank:
+        categories = list(bank.keys())
+
+    for label in categories:
+        for item in bank.get(label, []):
+            similarity = compute_feature_similarity(component_features, item["features"])
+            matches.append({
+                "image": item["image"],
+                "label": item["label"],
+                "bbox": item["bbox"],
+                "similarity": similarity,
+            })
     
     # Sort by similarity and return top matches
     matches.sort(key=lambda x: x["similarity"], reverse=True)
@@ -290,10 +322,29 @@ def _extract_fast_features(image_array: np.ndarray, bbox: Tuple[int, int, int, i
         feats["circularity"] = float((4.0 * math.pi * ca) / max(1.0, perim * perim))
         feats["solidity"] = float(ca / hull_area) if hull_area > 0 else 0.0
         feats["extent"] = float(ca / max(1.0, float(w * h)))
+        
+        # Add expert shape features (Hu Moments) for scale/rotation invariant shape matching
+        moments = cv2.moments(largest)
+        if moments.get("m00"):
+            hu = cv2.HuMoments(moments).flatten()
+            for index, value in enumerate(hu, start=1):
+                feats[f"hu_{index}"] = float(-math.copysign(1.0, value) * math.log10(abs(value) + 1e-12))
     else:
         feats["circularity"] = 0.0
         feats["solidity"] = 0.0
         feats["extent"] = 0.0
+        for i in range(1, 8):
+            feats[f"hu_{i}"] = 0.0
+
+    # Add expert texture/gradient features (HOG) to distinguish internal details (e.g. mixer blades vs empty tank)
+    try:
+        hog = cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9)
+        hog_vector = hog.compute(resized).flatten()
+        for index, value in enumerate(hog_vector[:36]): # Take first 36 bins to keep it fast
+            feats[f"hog_{index}"] = float(value)
+    except Exception:
+        pass
+
     return feats
 
 
@@ -308,7 +359,9 @@ def build_training_dataset() -> Tuple[pd.DataFrame, pd.Series]:
             continue
         img = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
         for ann in entry.get("annotations", []):
-            label = _normalize_label(ann.get("label", "other")) or "other"
+            label = _normalize_label(ann.get("label", ""))
+            if label not in TOP_LEVEL_LABELS:
+                continue
             bbox = ann.get("bbox")
             if not bbox or len(bbox) != 4:
                 continue
@@ -344,10 +397,10 @@ def train_model() -> Dict[str, Any]:
     y_int = y.map(label_to_int)
 
     clf = RandomForestClassifier(
-        n_estimators=30,
+        n_estimators=200,
         random_state=42,
         class_weight="balanced",
-        max_depth=8,
+        max_depth=None,
         min_samples_leaf=1,
         min_samples_split=2,
         max_features="sqrt",
@@ -366,7 +419,7 @@ def load_model():
     return joblib.load(MODEL_PATH)
 
 
-FEATURE_VERSION = 3  # increment when fast-feature schema changes
+FEATURE_VERSION = 4  # increment when fast-feature schema changes
 
 
 def load_model_cached():

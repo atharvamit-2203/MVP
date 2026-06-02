@@ -6,6 +6,91 @@
   gap: 24px;
 }
 
+/* Component Matching Styles */
+.component-matches-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+  align-items: stretch;
+}
+
+.component-match-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 16px;
+  transition: all 0.2s ease;
+}
+
+.component-match-card.matched {
+  border-color: rgba(34, 197, 94, 0.3);
+  background: rgba(34, 197, 94, 0.05);
+}
+
+.component-match-card.unmatched {
+  border-color: rgba(239, 68, 68, 0.3);
+  background: rgba(239, 68, 68, 0.05);
+}
+
+.component-match-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.match-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.match-header strong {
+  color: #fff;
+  font-size: 14px;
+}
+
+.match-badge {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.match-badge.success {
+  background: rgba(34, 197, 94, 0.2);
+  color: #22c55e;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.match-badge.warning {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.match-details {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.match-details div {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+}
+
+.match-details span {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.match-details strong {
+  color: #fff;
+}
+
 /* Dashboard layout */
 .dashboard {
   display: grid;
@@ -753,7 +838,7 @@
 .count-grid {
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .count-card {
@@ -871,6 +956,7 @@
 
 .json-card.compact .count-grid {
   gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .json-card.compact .count-card {

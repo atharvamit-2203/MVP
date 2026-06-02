@@ -47,12 +47,13 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(BACKEND_ROOT / ".env")
 
 ML_COUNT_MIN_CONFIDENCE = float(os.getenv("ML_COUNT_MIN_CONFIDENCE", "0.50"))
-FAST_ANALYSIS_TIMEOUT_SECONDS = float(os.getenv("FAST_ANALYSIS_TIMEOUT_SECONDS", "35"))
+# Must exceed Ollama completion budget (see OLLAMA_COMPLETION_TIMEOUT_SECONDS in local_detection).
+FAST_ANALYSIS_TIMEOUT_SECONDS = float(os.getenv("FAST_ANALYSIS_TIMEOUT_SECONDS", "38"))
 FAST_ANALYSIS_MAX_PAGES = max(1, int(os.getenv("FAST_ANALYSIS_MAX_PAGES", "1")))
 FAST_ANALYSIS_IMAGE_MAX_EDGE = max(512, int(os.getenv("FAST_ANALYSIS_IMAGE_MAX_EDGE", "1024")))
 FAST_ANALYSIS_MODE = os.getenv("FAST_ANALYSIS_MODE", "full").strip().lower()
 COMPONENT_LIBRARY_AUTO_TRAIN = os.getenv("COMPONENT_LIBRARY_AUTO_TRAIN", "true").strip().lower() in {"1", "true", "yes", "on"}
-DISABLE_OLLAMA_VERIFICATION = os.getenv("DISABLE_OLLAMA_VERIFICATION", "true").strip().lower() in {"1", "true", "yes", "on"}
+DISABLE_OLLAMA_VERIFICATION = os.getenv("DISABLE_OLLAMA_VERIFICATION", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 _component_training_task: asyncio.Task | None = None
 _analysis_warm: bool = False
@@ -142,6 +143,23 @@ class ComponentVerificationResponse(BaseModel):
 	message: str
 
 
+class ComponentMatch(BaseModel):
+	component_name: str
+	component_category: str | None = None
+	matched_library_image: str | None = None
+	matched_library_label: str | None = None
+	similarity_score: float
+	matches: bool
+
+
+class ComponentMatchingRequest(BaseModel):
+	components: list[dict[str, Any]]  # List of detected components with bbox and category
+
+
+class ComponentMatchingResponse(BaseModel):
+	matches: list[ComponentMatch]
+
+
 class BatchComponentVerificationRequest(BaseModel):
 	industry: str
 	components: list[ComponentMeta]
@@ -178,6 +196,7 @@ class DetectionResponse(BaseModel):
 	pages: list[PageDetectionResult]
 	industry: str | None = None
 	industry_warnings: dict[str, list[str]] = Field(default_factory=dict)
+	component_matches: list[ComponentMatch] = Field(default_factory=list)
 
 
 class ComponentPosition(BaseModel):
@@ -361,20 +380,12 @@ def _predict_trained_model_counts(frame: Image.Image, detections: list[dict[str,
     image_array = np.array(frame.convert("RGB"))
     scored = active_learning.predict_candidates(image_array, detections, model_blob=model_blob)
     counts = {key: 0 for key in local_detection.COUNT_KEYS}
-    high_conf_count = 0
     for candidate in scored:
         predicted = candidate.get("predicted")
         prob = float(candidate.get("prob", 0.0) or 0.0)
-        fallback_category = candidate.get("category")
-        fallback_conf = float(candidate.get("confidence", 0.0) or 0.0)
-        # Use a moderate confidence threshold for pumps/valves
-        if predicted in counts and prob >= 0.45:
+        if predicted in counts and prob >= 0.60:
             counts[predicted] += 1
-            if prob >= 0.45:
-                high_conf_count += 1
-        elif fallback_category in counts and fallback_conf >= local_detection.CONF_THRESH.get(fallback_category, 0.0):
-            counts[fallback_category] += 1
-    logger.info(f"Trained model predictions: {counts}, high confidence: {high_conf_count}/{len(scored)}")
+    logger.info(f"Trained model predictions: {counts}")
     return counts, scored
 
 
@@ -499,87 +510,31 @@ def _persist_component_library_samples(components: list[ComponentData]) -> int:
 			labels = ["other"]  # Will be filtered out later
 
 		# Detect individual components within the uploaded image
-		try:
-			# Convert to RGB for detection
-			image_rgb = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
-			# Detect shape components in the image
-			detected_components = local_detection.detect_shape_components(image_rgb, [])
-			
-			if detected_components and len(detected_components) > 0:
-				# Create annotations for each detected component
-				annotations = []
-				# If user provided multiple labels, distribute them across detected components
-				# If user provided single label, use it for all detected components
-				if len(labels) == 1:
-					# Single label - apply to all detected components
-					for det in detected_components:
-						bbox = det.get("bbox", [0, 0, width, height])
-						annotations.append({
-							"label": labels[0],
-							"bbox": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
-						})
-				else:
-					# Multiple labels - try to match detected categories with user labels
-					for det in detected_components:
-						bbox = det.get("bbox", [0, 0, width, height])
-						category = det.get("category", "other")
-						# Prioritize user-provided labels that match detected category
-						if category in labels:
-							component_label = category
-						else:
-							# Use the first label as default if no match
-							component_label = labels[0]
-						
-						annotations.append({
-							"label": component_label,
-							"bbox": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
-						})
-				
-				if annotations:
-					entry = {
-						"timestamp": datetime.utcnow().isoformat() + "Z",
-						"image": image_name,
-						"annotations": annotations,
-					}
-					with open(ann_path, "a", encoding="utf-8") as fh:
-						fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-					saved += 1
-					logger.info(f"Saved {len(annotations)} component detections from image {image_name} with labels {labels}")
-				else:
-					# Fallback to full image annotation if no valid detections
-					entry = {
-						"timestamp": datetime.utcnow().isoformat() + "Z",
-						"image": image_name,
-						"annotations": [{"label": labels[0], "bbox": [0, 0, int(width), int(height)]}],
-					}
-					with open(ann_path, "a", encoding="utf-8") as fh:
-						fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-					saved += 1
-					logger.info(f"Saved full image annotation for {image_name} (no components detected)")
-			else:
-				# Fallback to full image annotation if no detections
-				entry = {
-					"timestamp": datetime.utcnow().isoformat() + "Z",
-					"image": image_name,
-					"annotations": [{"label": labels[0], "bbox": [0, 0, int(width), int(height)]}],
-				}
-				with open(ann_path, "a", encoding="utf-8") as fh:
-					fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-				saved += 1
-				logger.info(f"Saved full image annotation for {image_name} (no components detected)")
-		except Exception as exc:
-			logger.warning(f"Component detection failed for {image_name}: {exc}, using full image annotation")
-			# Fallback to full image annotation on error
-			entry = {
-				"timestamp": datetime.utcnow().isoformat() + "Z",
-				"image": image_name,
-				"annotations": [{"label": labels[0], "bbox": [0, 0, int(width), int(height)]}],
-			}
-			with open(ann_path, "a", encoding="utf-8") as fh:
-				fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-			saved += 1
+		# Use the full image as one annotation per label.
+		# Component uploads are reference photos, not P&IDs — running shape
+		# detection on them produces unreliable sub-regions and wrong counts.
+		annotations = [{"label": label, "bbox": [0, 0, int(width), int(height)]} for label in labels]
+		entry = {
+			"timestamp": datetime.utcnow().isoformat() + "Z",
+			"image": image_name,
+			"annotations": annotations,
+		}
+		with open(ann_path, "a", encoding="utf-8") as fh:
+			fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+		saved += 1
+		logger.info(f"Saved annotation for {image_name} with labels {labels}")
+
+	if saved > 0:
+		local_detection.clear_annotation_templates_cache()
 
 	return saved
+
+
+def _should_use_component_library(components: list[ComponentData] | None) -> bool:
+	"""Use uploaded reference photos + trained model when samples exist."""
+	if components:
+		return True
+	return _active_model_blob() is not None
 
 
 def _schedule_component_library_training() -> None:
@@ -641,17 +596,69 @@ async def build_detection_response(file: UploadFile, industry: str | None = None
 		raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 	try:
-		pages = await detect_pages(frames)
+		use_library = _should_use_component_library(components)
+		pages = await detect_pages(frames, use_component_library=use_library)
 	except Exception as exc:  # noqa: BLE001
 		raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-	detected_industry = None
+	detected_industry = (industry or "").strip() or None
 	models_used = ["opencv+paddleocr", "opencv+heuristics"]
-	if _active_model_blob() is not None:
+	if use_library:
+		models_used.append("component_library/templates+random_forest")
+	elif _active_model_blob() is not None:
 		models_used.append("active_learning/random_forest")
 
 	# Industry validation disabled
 	industry_warnings: dict[str, list[str]] = {"component": [], "pid": []}
+
+	# Perform component matching against library
+	component_matches: list[ComponentMatch] = []
+	try:
+		# Get detections from the first page for matching
+		if frames and pages:
+			first_frame = frames[0]
+			use_library = _should_use_component_library(components)
+			analysis = await analyze_pid_image_async(
+				first_frame,
+				fast_mode=True,
+				use_component_library=use_library,
+			)
+			detections = analysis.get("detections", [])
+			image_array = np.array(first_frame.convert("RGB"))
+			
+			for detection in detections:
+				component_name = detection.get("name", "Unknown")
+				component_category = detection.get("category")
+				bbox = detection.get("bbox")
+				
+				if not bbox or len(bbox) != 4:
+					continue
+				
+				x, y, w, h = bbox
+				try:
+					component_features = active_learning._extract_fast_features(image_array, (x, y, w, h))
+					
+					library_matches = active_learning.match_component_to_library(
+						component_features,
+						component_category=component_category,
+						top_k=3
+					)
+					
+					best_match = library_matches[0] if library_matches else None
+					matches_bool = best_match and best_match["similarity"] > 0.7
+					
+					component_matches.append(ComponentMatch(
+						component_name=component_name,
+						component_category=component_category,
+						matched_library_image=best_match["image"] if best_match else None,
+						matched_library_label=best_match["label"] if best_match else None,
+						similarity_score=best_match["similarity"] if best_match else 0.0,
+						matches=matches_bool
+					))
+				except Exception as exc:
+					logger.warning(f"Failed to match component {component_name}: {exc}")
+	except Exception as exc:
+		logger.warning(f"Component matching failed: {exc}")
 
 	return DetectionResponse(
 		filename=file.filename or "uploaded-file",
@@ -662,6 +669,7 @@ async def build_detection_response(file: UploadFile, industry: str | None = None
 		pages=pages,
 		industry=detected_industry,
 		industry_warnings=industry_warnings,
+		component_matches=component_matches,
 	)
 
 
@@ -685,22 +693,80 @@ async def build_detection_and_coordinate_response(
 		raise HTTPException(status_code=400, detail="No pages available for analysis.")
 
 	first_frame = frames_to_analyze[0]
-	analysis = await analyze_pid_image_async(first_frame, fast_mode=True)
+	use_library = _should_use_component_library(components)
+	analysis = await analyze_pid_image_async(
+		first_frame,
+		fast_mode=True,
+		use_component_library=use_library,
+	)
 	scale_x = 1.0
 	scale_y = 1.0
 
-	trained_counts, _scored = _predict_trained_model_counts(first_frame, list(analysis.get("detections", [])))
-	analysis["trained_counts"] = trained_counts
+	if analysis.get("library_refined"):
+		analysis["trained_counts"] = local_detection.count_detections_by_category(
+			list(analysis.get("detections", []))
+		)
+	else:
+		trained_counts, _scored = _predict_trained_model_counts(
+			first_frame, list(analysis.get("detections", []))
+		)
+		analysis["trained_counts"] = trained_counts
 
 	pages = [counts_from_analysis_page(analysis, page_index=1)]
+
+	# Coordinates come from detections directly (same source as counts and library matching)
 	
-	detected_industry = None
+	detected_industry = (industry or "").strip() or None
 	models_used = ["opencv+paddleocr", "opencv+heuristics"]
-	if _active_model_blob() is not None:
+	if analysis.get("library_refined"):
+		models_used.append("component_library/templates+random_forest")
+	elif _active_model_blob() is not None:
 		models_used.append("active_learning/random_forest")
+	if analysis.get("used_ollama"):
+		models_used.append("ollama/phi3")
 
 	# Industry validation disabled
 	industry_warnings: dict[str, list[str]] = {"component": [], "pid": []}
+
+	# Perform component matching against library
+	component_matches: list[ComponentMatch] = []
+	try:
+		detections = analysis.get("detections", [])
+		image_array = np.array(first_frame.convert("RGB"))
+		
+		for detection in detections:
+			component_name = detection.get("name", "Unknown")
+			component_category = detection.get("category")
+			bbox = detection.get("bbox")
+			
+			if not bbox or len(bbox) != 4:
+				continue
+			
+			x, y, w, h = bbox
+			try:
+				component_features = active_learning._extract_fast_features(image_array, (x, y, w, h))
+				
+				library_matches = active_learning.match_component_to_library(
+					component_features,
+					component_category=component_category,
+					top_k=3
+				)
+				
+				best_match = library_matches[0] if library_matches else None
+				matches_bool = best_match and best_match["similarity"] > 0.7
+				
+				component_matches.append(ComponentMatch(
+					component_name=component_name,
+					component_category=component_category,
+					matched_library_image=best_match["image"] if best_match else None,
+					matched_library_label=best_match["label"] if best_match else None,
+					similarity_score=best_match["similarity"] if best_match else 0.0,
+					matches=matches_bool
+				))
+			except Exception as exc:
+				logger.warning(f"Failed to match component {component_name}: {exc}")
+	except Exception as exc:
+		logger.warning(f"Component matching failed: {exc}")
 
 	detection_response = DetectionResponse(
 		filename=file.filename or "uploaded-file",
@@ -711,6 +777,7 @@ async def build_detection_and_coordinate_response(
 		pages=pages,
 		industry=detected_industry,
 		industry_warnings=industry_warnings,
+		component_matches=component_matches,
 	)
 
 	coordinate_payload = analysis.get("coordinates") or _default_coordinate_payload()
@@ -727,7 +794,35 @@ async def build_detection_and_coordinate_response(
 
 
 def _infer_component_industry(component_name: str) -> str | None:
-	"""Industry detection disabled - returns None"""
+	"""Infer industry from component name using keyword matching.
+	
+	Returns 'Common P&ID Components' for standard components that apply to all industries,
+	or a specific industry if the component name contains industry-specific keywords.
+	"""
+	name = component_name.strip().lower()
+	if not name:
+		return None
+	
+	# Common P&ID components that apply to all industries
+	common_components = ("pump", "motor", "tank", "valve", "centrifugal", "gear", "hand", "dosing", "horizontal")
+	if any(comp in name for comp in common_components):
+		return "Common P&ID Components"
+	
+	# Industry-specific detection (can be expanded)
+	industry_patterns = [
+		("Water Treatment", ("water treatment", "wastewater", "effluent", "sewage", "clarifier", "sludge")),
+		("Oil & Gas", ("oil and gas", "oil & gas", "refinery", "crude", "pipeline", "gas")),
+		("Chemical Processing", ("chemical", "acid", "alkali", "solvent", "reactor", "distillation")),
+		("Pharmaceutical", ("pharma", "pharmaceutical", "sterile", "tablet", "bioreactor", "biotechnology")),
+		("Food & Beverage", ("food", "beverage", "dairy", "brew", "syrup", "juice")),
+		("Power Generation", ("power", "boiler", "steam", "turbine", "generator")),
+		("Manufacturing", ("manufacturing", "plant", "process", "production")),
+	]
+	
+	for industry, patterns in industry_patterns:
+		if any(pattern in name for pattern in patterns):
+			return industry
+	
 	return None
 
 
@@ -760,6 +855,70 @@ async def verify_component_industries(request: BatchComponentVerificationRequest
 			for index, result in enumerate(results)
 		],
 	)
+
+
+@app.post("/match_components", response_model=ComponentMatchingResponse)
+async def match_components(request: ComponentMatchingRequest, file: UploadFile = File(...)) -> ComponentMatchingResponse:
+	"""Match detected components from P&ID diagram against the component library."""
+	file_bytes = await file.read()
+	if not file_bytes:
+		raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+	
+	try:
+		frames, source_type = load_image_frames(file_bytes, file.filename, file.content_type)
+	except ValueError as exc:
+		raise HTTPException(status_code=400, detail=str(exc)) from exc
+	
+	if not frames:
+		raise HTTPException(status_code=400, detail="No valid frames found in file.")
+	
+	image_array = np.array(frames[0].convert("RGB"))
+	matches: list[ComponentMatch] = []
+	
+	for component in request.components:
+		component_name = component.get("name", "Unknown")
+		component_category = component.get("category")
+		bbox = component.get("bbox")
+		
+		if not bbox or len(bbox) != 4:
+			continue
+		
+		x, y, w, h = bbox
+		# Extract features for this component
+		try:
+			component_features = active_learning._extract_fast_features(image_array, (x, y, w, h))
+			
+			# Match against library
+			library_matches = active_learning.match_component_to_library(
+				component_features,
+				component_category=component_category,
+				top_k=3
+			)
+			
+			# Determine if it matches (similarity > 0.7)
+			best_match = library_matches[0] if library_matches else None
+			matches_bool = best_match and best_match["similarity"] > 0.7
+			
+			matches.append(ComponentMatch(
+				component_name=component_name,
+				component_category=component_category,
+				matched_library_image=best_match["image"] if best_match else None,
+				matched_library_label=best_match["label"] if best_match else None,
+				similarity_score=best_match["similarity"] if best_match else 0.0,
+				matches=matches_bool
+			))
+		except Exception as exc:
+			logger.warning(f"Failed to match component {component_name}: {exc}")
+			matches.append(ComponentMatch(
+				component_name=component_name,
+				component_category=component_category,
+				matched_library_image=None,
+				matched_library_label=None,
+				similarity_score=0.0,
+				matches=False
+			))
+	
+	return ComponentMatchingResponse(matches=matches)
 
 
 def _verify_component_industry_item(component_name: str, industry: str) -> ComponentVerificationResponse:
@@ -837,8 +996,20 @@ def counts_from_analysis_page(analysis: dict[str, Any], page_index: int) -> Page
 	phi3_counts = counts_to_model(phi3_counts_raw) if isinstance(phi3_counts_raw, dict) else None
 	trained_counts_raw = analysis.get("trained_counts")
 	trained_counts = counts_to_model(trained_counts_raw) if isinstance(trained_counts_raw, dict) else None
-	# Use shape detection counts directly - simpler and more reliable
-	final_counts = counts_to_model(analysis["counts"])
+	# Always derive counts from detections — the same source library matching uses.
+	# This guarantees counts and library matches are always in sync.
+	if analysis.get("library_refined"):
+		# analysis["counts"] includes Ollama adjustments when used_ollama is set
+		final_counts = counts_to_model(analysis["counts"])
+	else:
+		detection_counts = {key: 0 for key in local_detection.COUNT_KEYS}
+		for det in analysis.get("detections", []):
+			cat = det.get("category")
+			if cat in detection_counts:
+				detection_counts[cat] += 1
+		heuristic_counts = model_counts_to_dict(counts_to_model(analysis["counts"]))
+		merged = {k: max(detection_counts[k], heuristic_counts.get(k, 0)) for k in local_detection.COUNT_KEYS}
+		final_counts = counts_to_model(merged)
 	model_results = [
 		ModelDetectionResult(
 			page_index=page_index,
@@ -933,15 +1104,30 @@ async def build_batch_analysis_item(file: UploadFile) -> BatchAnalysisItem:
 		raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-async def detect_pages(frames: list[Image.Image]) -> list[PageDetectionResult]:
+async def detect_pages(
+	frames: list[Image.Image],
+	*,
+	use_component_library: bool = False,
+) -> list[PageDetectionResult]:
 	concurrency = max(1, int(os.getenv("PAGE_ANALYZE_CONCURRENCY", "4")))
 	semaphore = asyncio.Semaphore(concurrency)
 
 	async def analyze_page(page_index: int, frame: Image.Image) -> PageDetectionResult:
 		async with semaphore:
-			analysis = await asyncio.to_thread(analyze_pid_image, frame)
-			trained_counts, _scored = _predict_trained_model_counts(frame, list(analysis.get("detections", [])))
-			analysis["trained_counts"] = trained_counts
+			analysis = await analyze_pid_image_async(
+				frame,
+				fast_mode=True,
+				use_component_library=use_component_library,
+			)
+			if analysis.get("library_refined"):
+				analysis["trained_counts"] = local_detection.count_detections_by_category(
+					list(analysis.get("detections", []))
+				)
+			else:
+				trained_counts, _scored = _predict_trained_model_counts(
+					frame, list(analysis.get("detections", []))
+				)
+				analysis["trained_counts"] = trained_counts
 			return counts_from_analysis_page(analysis, page_index)
 
 	results = await asyncio.gather(*(analyze_page(page_index, frame) for page_index, frame in enumerate(frames, start=1)))
@@ -985,7 +1171,7 @@ async def analyze_fast(
 	industry: str = Form(None),
 	components_json: str = Form(None)
 ) -> dict[str, DetectionResponse | CoordinateDetectionResponse]:
-	"""Fast analysis endpoint that runs detection and coordinate calculation in parallel with 35-second timeout."""
+	"""Fast analysis endpoint that runs detection and coordinate calculation in parallel."""
 	components: list[ComponentData] | None = None
 	if components_json:
 		try:
@@ -996,28 +1182,14 @@ async def analyze_fast(
 	if components:
 		saved_samples = await asyncio.to_thread(_persist_component_library_samples, components)
 		if saved_samples > 0 and COMPONENT_LIBRARY_AUTO_TRAIN:
-			# Train synchronously when components are provided to ensure model uses new annotations
-			try:
-				await asyncio.wait_for(asyncio.to_thread(active_learning.train_model), timeout=20.0)
-				# Invalidate cache to ensure new model is loaded
-				active_learning.invalidate_model_cache()
-				logger.info(f"Synchronously trained model on {saved_samples} new component samples")
-			except asyncio.TimeoutError:
-				logger.warning(f"Synchronous training timed out after 20s, proceeding with existing model")
-			except Exception as exc:
-				logger.warning(f"Synchronous training failed: {exc}")
+			# Kick off retraining in the background so the current request can finish quickly.
+			_schedule_component_library_training()
+			logger.info(f"Scheduled background training on {saved_samples} new component samples")
 		else:
 			logger.info(f"Saved {saved_samples} component samples but auto-train is disabled")
 	
-	# Run detection with timeout
-	try:
-		detection_response, coordinate_response = await asyncio.wait_for(
-			build_detection_and_coordinate_response(file, industry, components),
-			timeout=FAST_ANALYSIS_TIMEOUT_SECONDS
-		)
-	except asyncio.TimeoutError:
-		logger.error(f"Analysis timed out after {FAST_ANALYSIS_TIMEOUT_SECONDS}s")
-		raise HTTPException(status_code=504, detail=f"Analysis timed out after {FAST_ANALYSIS_TIMEOUT_SECONDS} seconds")
+	# Run detection without an outer hard timeout so the full pipeline can complete.
+	detection_response, coordinate_response = await build_detection_and_coordinate_response(file, industry, components)
 	
 	return {
 		"detection": detection_response,
