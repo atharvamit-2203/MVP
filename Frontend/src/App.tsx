@@ -704,7 +704,17 @@ function App() {
   // Generate download URL whenever we have all data
   useEffect(() => {
     if (batchRuns.length) {
-      const combined = JSON.stringify({ runs: batchRuns }, null, 2)
+      const successfulRuns = batchRuns.filter((run) => run.coordinates && !run.error)
+      const payload =
+        successfulRuns.length === 1
+          ? successfulRuns[0].coordinates
+          : {
+              files: successfulRuns.map((run) => ({
+                filename: run.file.name,
+                coordinates: run.coordinates,
+              })),
+            }
+      const combined = JSON.stringify(payload, null, 2)
       const blob = new Blob([combined], { type: 'application/json' })
       const url = URL.createObjectURL(blob)
       setDownloadUrl(url)

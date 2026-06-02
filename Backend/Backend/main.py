@@ -200,10 +200,10 @@ class DetectionResponse(BaseModel):
 
 
 class ComponentPosition(BaseModel):
-	x: int = Field(..., ge=0)
-	y: int = Field(..., ge=0)
-	width: int = Field(..., ge=0)
-	height: int = Field(..., ge=0)
+	x: float = Field(..., ge=0)
+	y: float = Field(..., ge=0)
+	width: float = Field(..., ge=0)
+	height: float = Field(..., ge=0)
 
 
 class ComponentMeta(BaseModel):
@@ -213,6 +213,7 @@ class ComponentMeta(BaseModel):
 class ComponentChild(BaseModel):
 	meta: ComponentMeta
 	position: ComponentPosition
+	props: dict[str, Any] = Field(default_factory=dict)
 	type: str
 
 
@@ -223,6 +224,8 @@ class RootMeta(BaseModel):
 class Root(BaseModel):
 	children: list[ComponentChild]
 	meta: RootMeta
+	position: dict[str, Any] = Field(default_factory=dict)
+	props: dict[str, Any] = Field(default_factory=dict)
 	type: str
 
 

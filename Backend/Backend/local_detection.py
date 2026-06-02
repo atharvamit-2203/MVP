@@ -222,8 +222,8 @@ OLLAMA_USE_FOR_COUNTS = os.getenv("OLLAMA_USE_FOR_COUNTS", "true").strip().lower
 TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("TEMPLATE_MAX_PER_CATEGORY", "100")))
 TEMPLATE_MATCH_MAX_EDGE = max(640, int(os.getenv("TEMPLATE_MATCH_MAX_EDGE", "1920")))
 TEMPLATE_MAX_PEAKS = max(5, int(os.getenv("TEMPLATE_MAX_PEAKS", "50")))
-TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("TEMPLATE_MATCH_TIMEOUT_SECONDS", "30"))
-FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS", "12"))
+TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("TEMPLATE_MATCH_TIMEOUT_SECONDS", "60"))
+FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS", "25"))
 FAST_TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("FAST_TEMPLATE_MAX_PER_CATEGORY", "35")))
 FAST_TEMPLATE_MAX_TOTAL = max(4, int(os.getenv("FAST_TEMPLATE_MAX_TOTAL", "80")))
 FAST_MATCH_RELEVANT_ONLY = os.getenv("FAST_MATCH_RELEVANT_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -2921,8 +2921,15 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 	return {"counts": aggregated_counts, "industry": chosen_industry, "models_used": models}
 
 
-def detections_to_coordinates_payload(detections: list[dict[str, Any]]) -> dict[str, Any]:
+def detections_to_coordinates_payload(
+	detections: list[dict[str, Any]],
+	*,
+	canvas_width: int | None = None,
+	canvas_height: int | None = None,
+) -> dict[str, Any]:
 	children: list[dict[str, Any]] = []
+	label_counter = 0
+	category_counters: dict[str, int] = {key: 0 for key in COUNT_KEYS}
 	for detection in sorted(detections, key=lambda item: (item["bbox"][1], item["bbox"][0])):
 		x, y, width, height = detection["bbox"]
 		# Some matchers (notably ORB+homography) can produce negative coordinates.
@@ -2931,20 +2938,42 @@ def detections_to_coordinates_payload(detections: list[dict[str, Any]]) -> dict[
 		y = int(max(0, y))
 		width = int(max(0, width))
 		height = int(max(0, height))
+		category = str(detection.get("category", "") or "").lower()
+		if category in COUNT_KEYS:
+			component_type = "ia.display.view"
+			category_counters[category] += 1
+			component_name = f"{category.title()}_{category_counters[category]}"
+		else:
+			component_type = "ia.display.label"
+			label_counter += 1
+			component_name = f"Label_{label_counter}"
 		children.append(
 			{
-				"meta": {"name": detection["name"]},
-				"position": {"x": int(x), "y": int(y), "width": int(width), "height": int(height)},
-				"type": CATEGORY_TO_TYPE.get(detection["category"], "ia.symbol.other"),
+				"meta": {"name": component_name},
+				"position": {"x": float(x), "y": float(y), "width": float(width), "height": float(height)},
+				"props": {},
+				"type": component_type,
 			},
 		)
+
+	if canvas_width is None or canvas_height is None:
+		max_x = 0.0
+		max_y = 0.0
+		for child in children:
+			pos = child.get("position", {})
+			max_x = max(max_x, float(pos.get("x", 0.0)) + float(pos.get("width", 0.0)))
+			max_y = max(max_y, float(pos.get("y", 0.0)) + float(pos.get("height", 0.0)))
+		canvas_width = int(max(1.0, max_x))
+		canvas_height = int(max(1.0, max_y))
 	return {
 		"custom": {},
 		"params": {},
-		"props": {},
+		"props": {"defaultSize": {"width": int(canvas_width), "height": int(canvas_height)}},
 		"root": {
 			"children": children,
 			"meta": {"name": "root"},
+			"position": {"x": 0, "y": 0},
+			"props": {"style": {"backgroundColor": "#3C4653"}},
 			"type": "ia.container.coord",
 		},
 	}
@@ -3648,7 +3677,9 @@ async def analyze_pid_image_async(
 	coordinates_task = asyncio.create_task(
 		asyncio.to_thread(
 			detections_to_coordinates_payload,
-				dedupe_detections(filtered_for_coordinates, iou_threshold=0.8),
+			dedupe_detections(filtered_for_coordinates, iou_threshold=0.8),
+			canvas_width=int(image_array.shape[1]),
+			canvas_height=int(image_array.shape[0]),
 			),
 	)
 
