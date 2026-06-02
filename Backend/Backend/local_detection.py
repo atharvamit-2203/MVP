@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import os
+import random
 import re
 import json
 from pathlib import Path
@@ -17,6 +18,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+# Set random seed for deterministic behavior
+random.seed(42)
+np.random.seed(42)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
@@ -58,7 +63,9 @@ TEXT_CATEGORY_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 	("motor", ("mtr", "m-", "mo-", "motor-")),
 	("pump", ("p-", "pu-", "pmp", "pump-")),
 	("tank", ("tk-", "t-", "vessel-", "tank-", "column")),
-	("valve", ("xv", "cv", "hv", "lv", "sv", "pv", "tv", "gv", "bv", "wv", "pcv", "fcv", "lcv", "tcv", "psv", "nrv", "sdv", "mov", "sov")),
+	# Only unambiguous valve abbreviations — tv/pv removed as they match instrument tags
+	# fv- included with hyphen to match Fv-3-3040 style tags without matching bare instrument 'fv'
+	("valve", ("fv-", "xv", "hv", "lv", "sv", "gv", "bv", "wv", "pcv", "fcv", "lcv", "tcv", "psv", "nrv", "sdv", "mov", "sov")),
 ]
 
 # Simple initial-letter mapping for compact P&ID tags (e.g. 'm123' -> motor)
@@ -69,12 +76,101 @@ INITIAL_PREFIX_MAP: dict[str, str] = {
     "v": "valve",
 }
 
+# Instrument/transmitter tag prefixes that are NOT physical components.
+# These appear inside instrument bubbles (circles) and must not be counted as valves/motors/pumps.
+INSTRUMENT_TAG_PREFIXES: frozenset[str] = frozenset([
+	"tic", "tt", "te", "ti",           # Temperature
+	"fic", "ft", "fe", "fi", "fit",    # Flow
+	"lic", "lt", "le", "li",           # Level
+	"pic", "pt", "pe", "pi", "pit",    # Pressure
+	"aic", "at", "ae", "ai",           # Analytical
+	"pc", "lc", "pic", "lic", "fic",   # Controllers
+	"tic", "trc", "frc", "lrc", "prc", # Controllers/recorders
+	"tsh", "tsl", "fsh", "fsl",        # Switches
+	"tit", "fit", "lit", "pit",        # Indicators/transmitters
+])
+
+# Regex to detect instrument bubble tags like "TIC 100", "FT 101", "TE 100"
+_INSTRUMENT_TAG_RE = re.compile(
+	r"^(?:tic|tt|te|ti|fic|ft|fe|fi|fit|lic|lt|le|li|pic|pt|pe|pi|pit|aic|at|ae|ai|trc|frc|lrc|prc|tsh|tsl|fsh|fsl|tit|lit)\b",
+	re.IGNORECASE,
+)
+# Line labels like "From P-201" reference equipment off the sheet — not drawable symbols.
+_OFF_PAGE_LINE_RE = re.compile(
+	r"^\s*(?:from|to)\b",
+	re.IGNORECASE,
+)
+_OFF_PAGE_TAG_IN_TEXT_RE = re.compile(
+	r"\b(?:from|to)\s+[a-z]{0,4}[\s-]*\d{2,5}[a-z]?\b",
+	re.IGNORECASE,
+)
+_PUMP_TAG_RE = re.compile(r"\b(?:p|pu|pmp)-?\d{2,5}[a-z]?\b", re.IGNORECASE)
+
+_COUNTABLE_TEXT_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+	"motor": (
+		re.compile(r"\bm-?\d{2,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\bmo-?\d{2,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\bmtr-?\d{1,5}[a-z]?\b", re.IGNORECASE),
+	),
+	"pump": (
+		re.compile(r"\bp-?\d{2,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\bpu-?\d{2,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\bpmp-?\d{1,5}[a-z]?\b", re.IGNORECASE),
+	),
+	"tank": (
+		re.compile(r"\bt-?\d{2,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\btk-?\d{2,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\bv-?\d{2,5}[a-z]?\b", re.IGNORECASE),
+	),
+	"valve": (
+		re.compile(r"(?<![a-z0-9])(?:fv|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv|pcv|fcv|lcv|tcv|psv|nrv|sdv|mov|sov)-?\d[\d\-]*[a-z]?(?![a-z0-9])", re.IGNORECASE),
+		re.compile(r"(?<![a-z0-9])(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-?\d{1,5}[a-z]?(?![a-z0-9])", re.IGNORECASE),
+	),
+}
+
+
+def is_instrument_tag(text: str) -> bool:
+	"""Return True if the text looks like an instrument bubble tag (not a physical component)."""
+	return bool(_INSTRUMENT_TAG_RE.match(normalize_text(text)))
+
+
+def is_off_page_equipment_reference(text: str) -> bool:
+	"""True for line labels like 'From P-201' that name off-sheet equipment."""
+	normalized = normalize_text(text)
+	if not normalized:
+		return False
+	if _OFF_PAGE_LINE_RE.match(normalized):
+		return True
+	return bool(_OFF_PAGE_TAG_IN_TEXT_RE.search(normalized))
+
+
+def _strip_off_page_equipment_tags(text: str) -> str:
+	"""Remove off-page tag mentions so text-based counters do not inflate pumps/tanks."""
+	return _OFF_PAGE_TAG_IN_TEXT_RE.sub(" ", normalize_text(text or ""))
+
+
+def _countable_text_category(text: str) -> str | None:
+	"""Return a physical component category only for explicit countable tags.
+
+	This intentionally ignores bare words like "tank" or "valve" so OCR text
+	alone does not inflate counts when the diagram repeats labels.
+	"""
+	normalized = normalize_text(text)
+	if not normalized or is_instrument_tag(normalized) or is_off_page_equipment_reference(normalized):
+		return None
+	for category, patterns in _COUNTABLE_TEXT_PATTERNS.items():
+		if any(pattern.search(normalized) for pattern in patterns):
+			return category
+	return None
+
+
 CATEGORY_REGEX_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 	(
 		"valve",
 		(
 			r"\b(?:check\s*valve|gate\s*valve|globe\s*valve|ball\s*valve|butterfly\s*valve|plug\s*valve)\b",
 			r"\b(?:pcv|fcv|lcv|tcv|psv|nrv|sdv|xv|hv|lv|fv|sv|cv|tv|pv|mov|sov|bv|gv|wv)\b",
+			r"\b(?:fv|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-[\d\-]+[a-z]?\b",
 			r"\b(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-?\d{1,5}[a-z]?\b",
 			r"\b(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)\d{1,5}[a-z]?\b",
 			r"\bvalve\b",
@@ -82,32 +178,57 @@ CATEGORY_REGEX_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 	),
 	("pump", (r"\bp-?\d{2,5}[a-z]?\b", r"\bpu-?\d{2,5}[a-z]?\b", r"\bpmp-?\d{1,5}[a-z]?\b", r"\bpump\b")),
 	("motor", (r"\bm-?\d{2,5}[a-z]?\b", r"\bmo-?\d{2,5}[a-z]?\b", r"\bmtr-?\d{1,5}[a-z]?\b", r"\bmotor\b")),
-	("tank", (r"\b(?:tk|t|v)-?\d{2,5}[a-z]?\b", r"\btk-?\d{1,5}[a-z]?\b", r"\btank\b", r"\bvessel\b", r"\bcolumn\b")),
+	("tank", (
+		r"\b(?:tk|t|v)-?\d{2,5}[a-z]?\b",
+		r"\btk-?\d{1,5}[a-z]?\b",
+		r"\btank\b",
+		r"\bvessel\b",
+		r"\bcolumn\b",
+		r"\bdrum\b",
+		r"\bstorage\b",
+		r"\bseparator\b",
+		r"\breactor\b",
+		r"\baccumulator\b",
+		r"\breceiver\b",
+	)),
 ]
 
-OCR_MIN_TEXT_CONFIDENCE = float(os.getenv("OCR_MIN_TEXT_CONFIDENCE", "0.2"))
-OCR_MIN_COMPONENT_AREA = int(os.getenv("OCR_MIN_COMPONENT_AREA", "100"))
+OCR_MIN_TEXT_CONFIDENCE = float(os.getenv("OCR_MIN_TEXT_CONFIDENCE", "0.15"))
+OCR_MIN_COMPONENT_AREA = int(os.getenv("OCR_MIN_COMPONENT_AREA", "50"))
 PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "en")
 PADDLEOCR_USE_GPU = os.getenv("PADDLEOCR_USE_GPU", "false").strip().lower() in {"1", "true", "yes", "on"}
-# Force disable Ollama to prevent timeout issues - override any env settings
-OLLAMA_ENABLED = False
+# Re-enable Ollama with better error handling
+OLLAMA_ENABLED = os.getenv("OLLAMA_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3")
-# Comma-separated list of Ollama models to consult (e.g. "phi3,llama2")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3-mini")  # Use phi3-mini for faster inference
+# Comma-separated list of Ollama models to consult (e.g. "phi3-mini,llama3.2")
 OLLAMA_MODELS = os.getenv("OLLAMA_MODELS", OLLAMA_MODEL)
-OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "25"))
-# Shorter timeout used for the fast analysis path.
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "20"))
+# Per-request HTTP timeout for /analyze_fast. Keep this short so the fast path stays responsive.
 OLLAMA_FAST_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_FAST_TIMEOUT_SECONDS", "8"))
+# Total wall-clock time the API will wait for Ollama to finish (includes cold-start load).
+OLLAMA_COMPLETION_TIMEOUT_SECONDS = int(
+	os.getenv("OLLAMA_COMPLETION_TIMEOUT_SECONDS", str(max(OLLAMA_FAST_TIMEOUT_SECONDS + 2, 10)))
+)
+# When true, final counts follow Ollama output. Default to false so visual detections stay authoritative.
+OLLAMA_TRUST_COUNTS = os.getenv("OLLAMA_TRUST_COUNTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 # When false, Ollama is skipped in the count path for speed and determinism.
+# Expert-level: Enable Ollama verification by default for maximum accuracy
 OLLAMA_USE_FOR_COUNTS = os.getenv("OLLAMA_USE_FOR_COUNTS", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Cap reference images used for template matching (annotations folder can grow to 1000+ files).
+# Expert-level: Use maximum annotation images for best accuracy
+TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("TEMPLATE_MAX_PER_CATEGORY", "100")))
+TEMPLATE_MATCH_MAX_EDGE = max(640, int(os.getenv("TEMPLATE_MATCH_MAX_EDGE", "1920")))
+TEMPLATE_MAX_PEAKS = max(5, int(os.getenv("TEMPLATE_MAX_PEAKS", "50")))
+TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("TEMPLATE_MATCH_TIMEOUT_SECONDS", "30"))
 
 # Minimum confidence required to count a visual detection for each category.
-# Minimum confidence required to count a visual detection for each category.
+# Expert-level: Very low thresholds for maximum recall
 CONF_THRESH: dict[str, float] = {
-    "motor": 0.65,
-    "pump": 0.70,
-    "tank": 0.55,
-    "valve": 0.30,
+	"motor": 0.25,
+	"pump": 0.35,
+	"tank": 0.25,
+	"valve": 0.30,
 }
 
 
@@ -141,25 +262,35 @@ def bbox_area(box: tuple[int, int, int, int]) -> int:
 
 
 def prepare_ocr_image(image_array: np.ndarray, fast_mode: bool = False) -> np.ndarray:
-	"""Upscale and enhance the image before OCR to improve small tag recall."""
+	"""Upscale and enhance the image before OCR to improve small tag recall.
+	Expert-level: Very aggressive enhancement for maximum text detection accuracy."""
 	h, w = image_array.shape[:2]
 	max_edge = max(h, w)
 	prepared = image_array
-	target_edge = 1600 if fast_mode else 2400
+	target_edge = 2000 if fast_mode else 3200
 	if max_edge < target_edge:
 		scale = float(target_edge) / max_edge
 		prepared = cv2.resize(image_array, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 	gray = cv2.cvtColor(prepared, cv2.COLOR_RGB2GRAY)
 	
-	# Denoise for bad quality images
-	gray = cv2.fastNlMeansDenoising(gray, h=10)
+	# Denoise for bad quality images - very aggressive
+	gray = cv2.fastNlMeansDenoising(gray, h=5)
 	
-	clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+	# Expert-level: Very high CLAHE clip limit for maximum contrast
+	clahe = cv2.createCLAHE(clipLimit=4.5, tileGridSize=(6, 6))
 	boosted = clahe.apply(gray)
 	
-	# Unsharp masking for clearer text
-	gaussian = cv2.GaussianBlur(boosted, (0, 0), 2.0)
-	sharpened = cv2.addWeighted(boosted, 1.5, gaussian, -0.5, 0)
+	# Morphological operations to enhance text strokes - stronger
+	kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+	boosted = cv2.morphologyEx(boosted, cv2.MORPH_CLOSE, kernel)
+	boosted = cv2.morphologyEx(boosted, cv2.MORPH_OPEN, kernel)
+	
+	# Unsharp masking for clearer text - very strong enhancement
+	gaussian = cv2.GaussianBlur(boosted, (0, 0), 1.2)
+	sharpened = cv2.addWeighted(boosted, 2.2, gaussian, -1.2, 0)
+	
+	# Additional contrast boost
+	sharpened = cv2.normalize(sharpened, None, 0, 255, cv2.NORM_MINMAX)
 	
 	return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
 
@@ -204,37 +335,47 @@ def get_easyocr_engine() -> Any:
 	return easyocr.Reader([PADDLEOCR_LANG], gpu=False, verbose=False)
 
 
-@lru_cache(maxsize=1)
-def get_available_ollama_models() -> list[str]:
-	"""Query the Ollama server for available models and return a list of model names.
+_ollama_models_cache: list[str] | None = None
 
-	Returns an empty list on failure or if the server returns no models.
-	"""
+def get_available_ollama_models() -> list[str]:
+	"""Query the Ollama server for available models. Caches successful results."""
+	global _ollama_models_cache
+	if _ollama_models_cache is not None:
+		return _ollama_models_cache
 	try:
-		resp = requests.get(f"{OLLAMA_BASE_URL}/api/models", timeout=5)
+		resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
 		resp.raise_for_status()
 		body = resp.json()
 		models: list[str] = []
-		if isinstance(body, list):
-			for item in body:
-				if isinstance(item, str):
-					models.append(item)
-				elif isinstance(item, dict):
-					name = item.get("name") or item.get("model") or item.get("id")
-					if name:
-						models.append(str(name))
-		elif isinstance(body, dict):
-			candidates = body.get("models") or body.get("results") or []
-			for item in candidates:
-				if isinstance(item, str):
-					models.append(item)
-				elif isinstance(item, dict):
-					name = item.get("name") or item.get("model") or item.get("id")
-					if name:
-						models.append(str(name))
+		candidates = body.get("models") or []
+		for item in candidates:
+			if isinstance(item, str):
+				models.append(item)
+			elif isinstance(item, dict):
+				name = item.get("name") or item.get("model") or item.get("id")
+				if name:
+					models.append(str(name))
+		if models:
+			_ollama_models_cache = models
 		return models
 	except Exception:
 		return []
+
+
+def _prefer_fast_ollama_models(models: list[str]) -> list[str]:
+	"""Put small/fast models first so cold-start completes within the HTTP timeout."""
+
+	def _score(name: str) -> int:
+		n = name.lower()
+		if any(tok in n for tok in ("mini", "tiny", "phi", "1b", "2b", "3b", "small")):
+			return 100
+		if any(tok in n for tok in ("7b", "8b", "mistral")):
+			return 50
+		if any(tok in n for tok in ("13b", "34b", "70b", "65b")):
+			return 10
+		return 30
+
+	return sorted(models, key=_score, reverse=True)
 
 
 def run_ocr(engine: Any, image_array: np.ndarray) -> Any:
@@ -371,16 +512,37 @@ def classify_text_label(text: str) -> str | None:
 	normalized = normalize_text(text)
 	if not normalized:
 		return None
+
+	# Instrument bubble tags must never be classified as physical components
+	if is_instrument_tag(normalized):
+		return None
+	
+	# First check regex patterns (most precise)
 	for category, patterns in CATEGORY_REGEX_PATTERNS:
 		if any(re.search(pattern, normalized) for pattern in patterns):
 			return category
+	
+	# Then check text patterns (common abbreviations)
 	for category, patterns in TEXT_CATEGORY_PATTERNS:
 		if any(pattern in normalized for pattern in patterns):
 			return category
-	# Fallback: check for single-letter initial tags like 'm-123', 'p123', 't 45'
+	
+	# Enhanced fallback: check for single-letter initial tags like 'm-123', 'p123', 't 45'
 	initial_candidate = _infer_category_from_initial(normalized)
 	if initial_candidate:
 		return initial_candidate
+	
+	# Additional fallback: check for common P&ID tag patterns without numbers
+	# This catches labels like "MTR", "PMP", "TK", "VLV" etc
+	if any(x in normalized for x in ["mtr", "motor"]):
+		return "motor"
+	if any(x in normalized for x in ["pmp", "pump"]):
+		return "pump"
+	if any(x in normalized for x in ["tk", "tank", "vessel"]):
+		return "tank"
+	if any(x in normalized for x in ["vlv", "valve"]):
+		return "valve"
+	
 	return None
 
 
@@ -418,53 +580,24 @@ def infer_industry_from_text(text_blob: str) -> str:
 def extract_counts_from_text(text_blob: str) -> dict[str, int]:
 	"""Deterministic token-based extraction from OCR text to suggest counts.
 
-	This is conservative: it searches for common P&ID tokens and returns
-	minimal counts derived from explicit tokens (e.g., P-123 -> pump).
+	This is conservative: it searches only for explicit P&ID tags and returns
+	minimal counts derived from those tags (e.g., P-123 -> pump).
+	Off-page references (From P-201) are excluded — those are not symbols on the drawing.
 	"""
-	text = normalize_text(text_blob or "")
+	text = _strip_off_page_equipment_tags(text_blob or "")
 	counts = empty_counts()
-
-	# Pumps: explicit tags only (avoid counting plain text labels like "pump")
-	# Require at least 2 digits to avoid false matches
-	pumps = re.findall(r"\bp-?\d{2,5}[a-z]?\b", text)
-	pumps += re.findall(r"\bpu-?\d{2,5}[a-z]?\b", text)
-	pumps += re.findall(r"\bpmp-?\d{2,5}[a-z]?\b", text)
-	# Filter out matches that are part of longer words
-	pumps = [p for p in pumps if len(p) <= 10]
-	counts["pump"] = max(counts["pump"], len(set(pumps)))
-
-	# Motors: explicit tags only
-	motors = re.findall(r"\bm-?\d{2,5}[a-z]?\b", text)
-	motors += re.findall(r"\bmo-?\d{2,5}[a-z]?\b", text)
-	motors += re.findall(r"\bmtr-?\d{2,5}[a-z]?\b", text)
-	# Filter out matches that are part of longer words
-	motors = [m for m in motors if len(m) <= 10]
-	counts["motor"] = max(counts["motor"], len(set(motors)))
-
-	# Tanks: explicit tags only
-	tanks = re.findall(r"\bt-?\d{2,5}[a-z]?\b", text)
-	tanks += re.findall(r"\btk-?\d{2,5}[a-z]?\b", text)
-	tanks += re.findall(r"\bv-?\d{2,5}[a-z]?\b", text)
-	# Filter out matches that are part of longer words
-	tanks = [t for t in tanks if len(t) <= 10]
-	counts["tank"] = max(counts["tank"], len(set(tanks)))
-
-	# Valves: explicit tags only
-	valves = re.findall(r"\b(?:xv|cv|hv|lv|sv|pv|tv|gv|bv|wv|pcv|fcv|lcv|tcv|psv|nrv|sdv|mov|sov)-?\d{2,5}[a-z]?\b", text)
-	valves += re.findall(r"\b(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-?\d{2,5}[a-z]?\b", text)
-	# Filter out matches that are part of longer words
-	valves = [v for v in valves if len(v) <= 10]
-	counts["valve"] = max(counts["valve"], len(set(valves)))
+	for category, patterns in _COUNTABLE_TEXT_PATTERNS.items():
+		matches: set[str] = set()
+		for pattern in patterns:
+			matches.update(pattern.findall(text))
+		counts[category] = max(counts[category], len(matches))
 
 	return counts
 
 
 def preprocess_for_shapes(image_array: np.ndarray) -> np.ndarray:
 	gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-	
-	# Denoise for bad quality images while preserving edges
 	gray = cv2.bilateralFilter(gray, 9, 75, 75)
-	
 	blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 	adaptive = cv2.adaptiveThreshold(
 		blurred,
@@ -474,11 +607,10 @@ def preprocess_for_shapes(image_array: np.ndarray) -> np.ndarray:
 		41,
 		10,
 	)
-	# Close small interior gaps to preserve hollow shapes like tanks
-	kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-	closed = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel, iterations=2)
-	# Remove small noise
-	kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+	# Use moderate kernel for balanced noise reduction and detail preservation
+	kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+	closed = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel, iterations=1)
+	kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
 	cleaned = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel2, iterations=1)
 	return cleaned
 
@@ -491,11 +623,14 @@ def detect_text_driven_components(ocr_detections: list[dict[str, Any]]) -> tuple
 	for detection in ocr_detections:
 		text = detection["text"]
 		text_blob_parts.append(text)
-		category = classify_text_label(text)
+		# Skip instrument bubble tags — they are not physical components
+		if is_instrument_tag(text) or is_off_page_equipment_reference(text):
+			continue
+		category = _countable_text_category(text)
 		if category is None:
 			continue
-		# Only count if confidence is reasonable
-		if detection.get("confidence", 0.0) < 0.3:
+		# Only count if confidence is reasonable - lowered threshold to catch more text-based detections
+		if detection.get("confidence", 0.0) < 0.25:
 			continue
 		counts[category] += 1
 		components.append(
@@ -504,10 +639,277 @@ def detect_text_driven_components(ocr_detections: list[dict[str, Any]]) -> tuple
 				"category": category,
 				"bbox": detection["bbox"],
 				"confidence": detection["confidence"],
+				"source": "ocr",
 			},
 		)
 
 	return components, counts, infer_industry_from_text(" ".join(text_blob_parts))
+
+
+_VALVE_TAG_RE = re.compile(
+	r"\b(?:fv|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv|pcv|fcv|lcv|tcv|psv|nrv|sdv|mov|sov)(?:-[\d][\d\-]*[a-z]?|\b)",
+	re.IGNORECASE,
+)
+_NON_COMPONENT_EQUIPMENT_RE = re.compile(
+	r"\b(?:mixer|reactor|sample\s*point|instrument\s*air|transfer\s*pump)\b",
+	re.IGNORECASE,
+)
+_INSTRUMENT_CONTROLLER_RE = re.compile(
+	r"\b(?:pc|lc|pic|lic|fic|trc|frc|prc)\s*\d*\b",
+	re.IGNORECASE,
+)
+
+
+def _effective_aspect_ratio(aspect_ratio: float) -> float:
+	return max(float(aspect_ratio), 1.0 / max(float(aspect_ratio), 0.01))
+
+
+def _min_tank_area(image_area: float | None) -> float:
+	threshold = 350.0
+	if image_area is not None:
+		threshold = max(threshold, image_area * 0.00085)
+	return threshold
+
+
+def _max_valve_area(image_area: float | None) -> float:
+	"""Scale valve size cap with diagram resolution (bow-ties grow on large exports)."""
+	if image_area is None:
+		return 8000.0
+	return max(8000.0, image_area * 0.012)
+
+
+def _is_tank_like_geometry(
+	area: float,
+	aspect_ratio: float,
+	extent: float,
+	solidity: float,
+	image_area: float | None = None,
+) -> bool:
+	"""True for P&ID vessel silhouettes (vertical columns, horizontal drums).
+	Expert-level: Much more permissive thresholds to catch all tank/vessel variants."""
+	if area < _min_tank_area(image_area):
+		return False
+	min_fraction = 0.0005 if image_area is not None else 0.0
+	if image_area is not None and area < max(250.0, image_area * min_fraction):
+		return False
+	eff_aspect = _effective_aspect_ratio(aspect_ratio)
+	if eff_aspect < 1.01 or eff_aspect > 25.0:
+		return False
+	if extent < 0.08 or solidity < 0.22:
+		return False
+	return True
+
+
+def _is_horizontal_vessel_geometry(
+	area: float,
+	aspect_ratio: float,
+	extent: float,
+	solidity: float,
+	image_area: float | None = None,
+	bbox: tuple[int, int, int, int] | None = None,
+	image_height: int | None = None,
+) -> bool:
+	"""Horizontal feed-line drums (wide, medium-large rectangles — not pipe segments).
+	Expert-level: Much more permissive thresholds to catch all drum variants."""
+	if image_area is not None and area > image_area * 0.035:
+		return False
+	min_area = 550.0
+	if image_area is not None:
+		min_area = max(min_area, image_area * 0.0008)
+	if area < min_area or area > 2200.0:
+		return False
+	eff_aspect = _effective_aspect_ratio(aspect_ratio)
+	if eff_aspect < 3.0 or eff_aspect > 10.0:
+		return False
+	if extent < 0.32 or solidity < 0.42:
+		return False
+	if bbox is not None and image_height is not None and image_height > 0:
+		center_y = bbox[1] + bbox[3] / 2.0
+		if center_y > image_height * 0.68:
+			return False
+	return True
+
+
+def _is_circular_vessel_geometry(
+	area: float,
+	aspect_ratio: float,
+	circularity: float,
+	extent: float,
+	solidity: float,
+	image_area: float | None = None,
+) -> bool:
+	"""Circular vessels and round tanks (spherical tanks, storage spheres).
+	Expert-level: Detect circular tank shapes that may be missed by rectangular tank detection."""
+	if area < 400.0:
+		return False
+	if image_area is not None and area > image_area * 0.020:
+		return False
+	min_fraction = 0.0006 if image_area is not None else 0.0
+	if image_area is not None and area < max(350.0, image_area * min_fraction):
+		return False
+	eff_aspect = _effective_aspect_ratio(aspect_ratio)
+	# Circular vessels should have aspect ratio close to 1.0
+	if eff_aspect < 0.85 or eff_aspect > 1.18:
+		return False
+	# High circularity for round shapes
+	if circularity < 0.65:
+		return False
+	if extent < 0.55 or solidity < 0.65:
+		return False
+	return True
+
+
+def calculate_hu_moments(contour: np.ndarray) -> np.ndarray:
+	"""Calculate Hu moments for shape description.
+	
+	Hu moments are invariant to translation, scale, and rotation,
+	making them excellent for shape matching regardless of orientation.
+	"""
+	moments = cv2.moments(contour)
+	hu_moments = cv2.HuMoments(moments)
+	# Log transform to make them more usable
+	hu_moments = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)
+	return hu_moments.flatten()
+
+
+def calculate_shape_descriptors(contour: np.ndarray) -> dict[str, float]:
+	"""Calculate comprehensive shape descriptors for expert-level geometry analysis.
+	
+	Returns a dictionary with various shape metrics including:
+	- Area, perimeter, aspect ratio
+	- Circularity, solidity, extent
+	- Eccentricity, compactness
+	- Hu moments (shape signature)
+	"""
+	if len(contour) < 5:
+		return {}
+	
+	area = cv2.contourArea(contour)
+	if area <= 0:
+		return {}
+	
+	perimeter = cv2.arcLength(contour, True)
+	if perimeter <= 0:
+		return {}
+	
+	# Basic metrics
+	bounding_rect = cv2.boundingRect(contour)
+	rect_width, rect_height = bounding_rect[2], bounding_rect[3]
+	aspect_ratio = float(rect_width) / max(rect_height, 1)
+	
+	# Shape metrics
+	circularity = 4 * math.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+	solidity = area / cv2.contourArea(cv2.convexHull(contour)) if area > 0 else 0
+	extent = area / (rect_width * rect_height) if rect_width * rect_height > 0 else 0
+	
+	# Ellipse fitting for eccentricity
+	if len(contour) >= 5:
+		ellipse = cv2.fitEllipse(contour)
+		major_axis = max(ellipse[1])
+		minor_axis = min(ellipse[1])
+		eccentricity = math.sqrt(1 - (minor_axis / major_axis) ** 2) if major_axis > 0 else 0
+	else:
+		eccentricity = 0
+	
+	# Compactness
+	compactness = (perimeter * perimeter) / area if area > 0 else 0
+	
+	# Hu moments for shape signature
+	hu_moments = calculate_hu_moments(contour)
+	
+	return {
+		"area": area,
+		"perimeter": perimeter,
+		"aspect_ratio": aspect_ratio,
+		"circularity": circularity,
+		"solidity": solidity,
+		"extent": extent,
+		"eccentricity": eccentricity,
+		"compactness": compactness,
+		"hu_moments": hu_moments,
+	}
+
+
+def _is_compact_bowtie_valve(
+	area: float,
+	aspect_ratio: float,
+	circularity: float,
+	vertex_count: int,
+	extent: float,
+	solidity: float,
+	image_area: float | None = None,
+	tank_like: bool = False,
+	bbox: tuple[int, int, int, int] | None = None,
+) -> bool:
+	"""Classic on-sheet bow-tie valve symbol (compact, nearly square).
+	Expert-level: More permissive thresholds to catch more valve variants."""
+	if not _is_valve_like_geometry(
+		area,
+		aspect_ratio,
+		circularity,
+		vertex_count,
+		extent,
+		solidity,
+		image_area,
+		tank_like=tank_like,
+		bbox=bbox,
+	):
+		return False
+	eff_aspect = _effective_aspect_ratio(aspect_ratio)
+	if eff_aspect > 2.0:
+		return False
+	if area < 40.0:
+		return False
+	max_area = 300.0
+	if image_area is not None:
+		max_area = min(max_area, image_area * 0.0005)
+	if area > max_area:
+		return False
+	if circularity > 0.65:
+		return False
+	return True
+
+
+def _is_valve_like_geometry(
+	area: float,
+	aspect_ratio: float,
+	circularity: float,
+	vertex_count: int,
+	extent: float,
+	solidity: float,
+	image_area: float | None = None,
+	tank_like: bool = False,
+	bbox: tuple[int, int, int, int] | None = None,
+) -> bool:
+	"""Bow-tie / diamond valve symbols on P&IDs (compact, low circularity).
+	Expert-level: More permissive thresholds to catch more valve variants."""
+	if tank_like:
+		return False
+	if image_area is not None and area > _max_valve_area(image_area):
+		return False
+	if bbox is not None and image_area is not None:
+		_bw, _bh = bbox[2], bbox[3]
+		if _bw * _bh > image_area * 0.015:
+			return False
+		max_symbol = math.sqrt(image_area) * 0.25
+		if max(_bw, _bh) > max_symbol:
+			return False
+	# Expert-level: Wider vertex count range for various valve shapes
+	if not (3 <= vertex_count <= 20):
+		return False
+	# Expert-level: Wider aspect ratio range
+	if not (0.20 <= aspect_ratio <= 4.0):
+		return False
+	# Expert-level: Wider circularity range
+	if not (0.02 <= circularity <= 0.92):
+		return False
+	# Expert-level: Wider extent range
+	if not (0.05 <= extent <= 0.98):
+		return False
+	# Expert-level: More permissive solidity threshold
+	if solidity > 0.88:
+		return False
+	return True
 
 
 def nearby_ocr_texts(
@@ -541,26 +943,54 @@ def classify_visual_candidate(
 	extent: float,
 	solidity: float,
 	image_area: float | None = None,
+	image_height: int | None = None,
 ) -> tuple[str | None, str, float]:
 	nearby = nearby_ocr_texts(candidate_box, ocr_detections)
 	nearby_blob = " ".join(item["normalized_text"] for item in nearby)
 	nearby_text = " ".join(item["text"] for item in nearby).strip()
 	confidence = 0.0
-	
+
+	tank_like = _is_tank_like_geometry(area, aspect_ratio, extent, solidity, image_area)
+	max_valve_area = _max_valve_area(image_area)
+
+	valve_like_geometry = _is_valve_like_geometry(
+		area,
+		aspect_ratio,
+		circularity,
+		vertex_count,
+		extent,
+		solidity,
+		image_area,
+		tank_like=tank_like,
+		bbox=candidate_box,
+	)
+
+	# Reject instrument bubble tags — circles with TIC/TT/FT/etc. are instruments, not components
+	for det in nearby:
+		if is_instrument_tag(det.get("normalized_text", "")):
+			return None, "", 0.0
+
+	# Controller squares (PC/LC/…) are instruments, not tanks or valves.
+	if _INSTRUMENT_CONTROLLER_RE.search(nearby_blob):
+		return None, nearby_text, 0.0
+
+	# Instrument bubbles are nearly circular; do not treat them as valves without an explicit tag.
+	if circularity >= 0.72 and 6 <= vertex_count <= 14 and not _VALVE_TAG_RE.search(nearby_blob):
+		return None, nearby_text, 0.0
+
+	# Major equipment blocks (mixer, reactor, sample point) are not valves.
+	if _NON_COMPONENT_EQUIPMENT_RE.search(nearby_blob) and not _VALVE_TAG_RE.search(nearby_blob):
+		return None, nearby_text, 0.0
+
 	# Reject shape candidates that are essentially just unclassified text blobs
+	# Only reject if the overlapping text is NOT a known valve/component label
 	for det in nearby:
 		if iou(candidate_box, det["bbox"]) > 0.6:
 			text_cat = classify_text_label(det.get("normalized_text", ""))
 			if not text_cat:
-				return None, "", 0.0
-
-	valve_like_geometry = (
-		3 <= vertex_count <= 10
-		and 0.35 <= aspect_ratio <= 4.5
-		and 0.08 <= circularity <= 0.75
-		and 0.10 <= extent <= 0.82
-		and solidity <= 0.85
-	)
+				# Allow if the shape has valve-like geometry (e.g. butterfly valve near ISA label)
+				if not valve_like_geometry:
+					return None, "", 0.0
 
 	if nearby_blob:
 		nearby_category = classify_text_label(nearby_blob)
@@ -581,78 +1011,90 @@ def classify_visual_candidate(
 					confidence = 0.88
 					return initial_map, det.get("text") or initial_map.title(), confidence
 
-	# Strong geometry-first valve fallback.
-	# Compact bow-tie / diamond / check-valve symbols often have a low solidity,
-	# lower circularity, and a near-square footprint even when vertex counting is noisy.
+	# Tanks/vessels before valve heuristics — vertical columns, horizontal feed-line drums, or circular vessels.
+	horizontal_drum = aspect_ratio >= 3.0
+	center_y = candidate_box[1] + candidate_box[3] / 2.0
+	circular_vessel = _is_circular_vessel_geometry(
+		area,
+		aspect_ratio,
+		circularity,
+		extent,
+		solidity,
+		image_area,
+	)
 	if (
-		3 <= vertex_count <= 12
-		and 0.65 <= aspect_ratio <= 1.6
-		and 0.05 <= circularity <= 0.78
-		and 0.08 <= extent <= 0.80
-		and solidity <= 0.92
-		and area <= 8000
+		(tank_like and area >= 250 and extent >= 0.20 and solidity >= 0.35 and not horizontal_drum)
+		or (horizontal_drum and _is_horizontal_vessel_geometry(
+			area,
+			aspect_ratio,
+			extent,
+			solidity,
+			image_area,
+			bbox=candidate_box,
+			image_height=image_height,
+		))
+		or circular_vessel
 	):
-		confidence = min(0.9, 0.4 + (0.2 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0))) + (0.2 if vertex_count >= 5 else 0.0) + (0.1 if solidity <= 0.7 else 0.0))
-		return "valve", nearby_text or "Valve", confidence
-
-	# Additional valve-only promotion when the text looks like a common tag.
-	if re.search(r"\b(?:xv|cv|hv|lv|sv|pv|tv|gv|bv|wv|pcv|fcv|lcv|tcv|psv|nrv|sdv|mov|sov)\b", nearby_blob) and len(nearby) > 0:
-		# Reject promotion for candidates that are very low-extent/low-solidity (likely a text region).
-		if extent < 0.12 or solidity < 0.20:
-			pass
-		else:
-			confidence = 0.85
-			return "valve", nearby_text or "Valve", confidence
-
-	# Geometry-first valve promotion: compact bow-tie / diamond / triangle-like symbols
-	# should resolve to valve before the looser pump/motor heuristics below.
-	if valve_like_geometry and area <= 6000:
-		confidence = min(0.88, 0.35 + (extent * 0.25) + (solidity * 0.25) + (0.25 if vertex_count >= 5 else 0.0))
-		return "valve", nearby_text or "Valve", confidence
-
-	# Valves are often compact symbols (diamond/triangle/bow-tie) with specific geometry.
-	# Tighten thresholds to reduce false positives from other small shapes.
-	if 3 <= vertex_count <= 8 and 0.4 <= aspect_ratio <= 2.0 and 0.12 <= circularity <= 0.6 and 0.20 <= extent <= 0.70:
-		if area <= 2000:
-			confidence = min(0.8, (extent + solidity) / 2.0)
-			return "valve", nearby_text or "Valve", confidence
-
-	# Pumps are often elongated machine symbols with moderate circularity
-	# Improved thresholds for pump detection
-	if 1.1 <= aspect_ratio <= 6.0 and area >= 200 and extent >= 0.2 and solidity >= 0.35 and not valve_like_geometry:
-		confidence = min(0.75, (extent + solidity + (1.0 / aspect_ratio)) / 3.0)
-		return "pump", nearby_text or "Pump", confidence
-	# 1. Explicit geometry-based checks for motors and pumps
-	# Motors: typically perfect circles, moderate area
-	if 0.85 <= circularity <= 1.0 and 8 <= vertex_count <= 16 and area >= 100:
-		confidence = min(0.9, 0.5 + (0.4 * circularity))
-		return "motor", nearby_text or "Motor", confidence
-
-	# Pumps: often circular main body with a small attached triangle/polygon, leading to slightly lower circularity but high solidity.
-	if 0.50 <= circularity <= 0.88 and 0.80 <= solidity <= 1.0 and 5 <= vertex_count <= 14 and area >= 150:
-		confidence = min(0.85, 0.4 + (0.3 * circularity) + (0.2 * solidity))
-		return "pump", nearby_text or "Pump", confidence
-
-	# 2. Tanks are larger vessels — evaluate before valves to prevent large rectangles from being classified as valves
-	tank_threshold = 100
-	if image_area is not None:
-		# Require tank to be at least 0.05% of the entire image
-		tank_threshold = max(tank_threshold, int(image_area * 0.0005))
-	if area >= tank_threshold and 0.15 <= aspect_ratio <= 6.0 and extent >= 0.12:
-		# If the shape is large, heavily penalize it for being classified as a valve later
-		confidence = min(0.85, extent + 0.1)
+		# Expert-level: Multi-factor confidence calculation for more accurate tank detection
+		base_confidence = extent + 0.25
+		eff_aspect = _effective_aspect_ratio(aspect_ratio)
+		# Boost confidence for circular vessels (high circularity indicates clear tank shape)
+		if circular_vessel:
+			base_confidence = min(0.85, base_confidence + 0.10)
+		# Boost confidence for horizontal drums with good aspect ratio
+		elif horizontal_drum and eff_aspect >= 4.0 and eff_aspect <= 7.0:
+			base_confidence = min(0.82, base_confidence + 0.08)
+		# Boost confidence for vertical tanks with good solidity
+		elif not horizontal_drum and solidity >= 0.45:
+			base_confidence = min(0.80, base_confidence + 0.05)
+		confidence = min(0.85, base_confidence)
 		return "tank", nearby_text or "Tank", confidence
 
-	# 3. Heuristic checks for Valves (usually small, bow-tie/diamond)
-	if valve_like_geometry and area <= 10000:
-		# Confidence boosted if aspect ratio is close to 1.0 (square-ish footprint)
-		confidence = min(0.85, 0.5 + (0.3 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0))))
-		return "valve", nearby_text or "Valve", confidence
+	# Additional valve promotion when OCR shows an explicit valve tag.
+	if _VALVE_TAG_RE.search(nearby_blob) and len(nearby) > 0:
+		if extent >= 0.15 and solidity >= 0.25 and area >= 80 and area <= max_valve_area:
+			confidence = 0.75
+			return "valve", nearby_text or "Valve", confidence
 
-	# 4. Fallback pump check: less strict, handles irregular pump shapes.
-	if 0.3 <= circularity <= 0.95 and 0.5 <= solidity <= 1.0 and 4 <= vertex_count <= 20 and area >= 200:
-		confidence = min(0.75, 0.3 + (0.4 * circularity))
+	# Geometry-only valves: compact bow-tie symbols (reject elongated instrument/line blobs).
+	if _is_compact_bowtie_valve(
+		area,
+		aspect_ratio,
+		circularity,
+		vertex_count,
+		extent,
+		solidity,
+		image_area,
+		tank_like=tank_like,
+		bbox=candidate_box,
+	):
+		if circularity <= 0.55:
+			confidence = min(
+				0.78,
+				0.35
+				+ (0.20 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0)))
+				+ (0.15 if vertex_count >= 4 else 0.0)
+				+ (0.10 if solidity <= 0.70 else 0.0),
+			)
+			return "valve", nearby_text or "Valve", confidence
+
+	# Motors: typically perfect circles, moderate area
+	if 0.80 <= circularity <= 1.0 and 6 <= vertex_count <= 20 and area >= 100 and solidity >= 0.75:
+		confidence = min(0.85, 0.45 + (0.35 * circularity))
+		return "motor", nearby_text or "Motor", confidence
+
+	# Pumps: require an on-sheet pump tag nearby (not a "From P-201" line label).
+	pump_tag_nearby = bool(_PUMP_TAG_RE.search(nearby_blob)) and not is_off_page_equipment_reference(nearby_blob)
+	if (
+		pump_tag_nearby
+		and 0.55 <= circularity <= 0.95
+		and 0.70 <= solidity <= 1.0
+		and 5 <= vertex_count <= 15
+		and area >= 120
+	):
+		confidence = min(0.80, 0.35 + (0.30 * circularity) + (0.15 * solidity))
 		return "pump", nearby_text or "Pump", confidence
+
 	return None, nearby_text, confidence
 
 
@@ -661,7 +1103,8 @@ def detect_shape_components(
 	ocr_detections: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
 	# Downscale for faster contour detection, then rescale coordinates back to original.
-	max_edge = int(os.getenv("SHAPE_DETECT_MAX_EDGE", "1024"))
+	# Expert-level: Higher resolution for better small component detection
+	max_edge = int(os.getenv("SHAPE_DETECT_MAX_EDGE", "1536"))
 	orig_h, orig_w = image_array.shape[0], image_array.shape[1]
 	image_area = orig_h * orig_w
 	scale = 1.0
@@ -674,11 +1117,12 @@ def detect_shape_components(
 		small = image_array
 
 	mask = preprocess_for_shapes(small)
-	contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+	# Use RETR_LIST to find internal valve symbols; RETR_EXTERNAL merges them into line blobs.
+	contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 	candidates: list[dict[str, Any]] = []
 	
-	# Limit number of contours to process and filter by area
-	max_contours = int(os.getenv("SHAPE_DETECT_MAX_CONTOURS", "500"))
+	# Expert-level: Process more contours for better coverage
+	max_contours = int(os.getenv("SHAPE_DETECT_MAX_CONTOURS", "2000"))
 	if len(contours) > max_contours:
 		contours = sorted(contours, key=cv2.contourArea, reverse=True)[:max_contours]
 
@@ -686,8 +1130,8 @@ def detect_shape_components(
 		area_small = float(cv2.contourArea(contour))
 		# convert area back to original image scale
 		area = area_small / (scale * scale) if scale > 0 and scale < 1.0 else area_small
-		# Conservative area threshold to avoid detecting noise but catch actual components
-		min_area = max(180.0, image_area * 0.0002)
+		# Maximum sensitivity: Very low minimum area to catch all components
+		min_area = max(10.0, image_area * 0.00001)
 		if area < min_area:
 			continue
 		x_s, y_s, width_s, height_s = cv2.boundingRect(contour)
@@ -699,10 +1143,10 @@ def detect_shape_components(
 			height = int(height_s / scale)
 		else:
 			x, y, width, height = x_s, y_s, width_s, height_s
-		if width < 10 or height < 10:
+		if width < 5 or height < 5:
 			continue
 		aspect_ratio = width / max(height, 1)
-		if aspect_ratio > 10.0 or aspect_ratio < 0.10:
+		if aspect_ratio > 15.0 or aspect_ratio < 0.05:
 			continue
 		# Note: perimeter computed on small contour must be scaled as well; approximate using scaled bbox
 		perimeter = float(cv2.arcLength(contour, True))
@@ -730,16 +1174,15 @@ def detect_shape_components(
 			extent,
 			solidity,
 			image_area,
+			image_height=orig_h,
 		)
 		if category is None:
 			continue
 		# Use the confidence from classification, but ensure minimum threshold
-		confidence = max(0.3, confidence)
-		# For all categories, require reasonable confidence to avoid false positives
-		if confidence < 0.50:
-			continue
-		# For valves, require higher confidence
-		if category == "valve" and confidence < 0.50:
+		confidence = max(0.25, confidence)
+		# Use category-specific confidence thresholds from CONF_THRESH
+		min_conf = CONF_THRESH.get(category, 0.50)
+		if confidence < min_conf:
 			continue
 		# Filter out tiny valve-like detections that sit on the image top edge (likely annotation marks)
 		if category == "valve":
@@ -753,6 +1196,7 @@ def detect_shape_components(
 				"category": category,
 				"bbox": (x, y, width, height),
 				"confidence": confidence,
+				"source": "shape",
 				"area": area,
 				"circularity": circularity,
 				"aspect_ratio": aspect_ratio,
@@ -763,11 +1207,12 @@ def detect_shape_components(
 		)
 
 	logger.info(f"Shape detection found {len(candidates)} candidates")
+	logger.debug(f"Shape detection category breakdown: { {k: sum(1 for c in candidates if c['category']==k) for k in ('valve','tank','pump','motor')} }")
 	return candidates
 
 
-def dedupe_detections(detections: list[dict[str, Any]], iou_threshold: float = 0.3) -> list[dict[str, Any]]:
-	"""Remove duplicate detections using IoU. Lower threshold to be more aggressive in deduplication."""
+def dedupe_detections(detections: list[dict[str, Any]], iou_threshold: float = 0.45) -> list[dict[str, Any]]:
+	"""Remove duplicate detections using IoU within the same category."""
 	ordered = sorted(detections, key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
 	kept: list[dict[str, Any]] = []
 	for candidate in ordered:
@@ -785,12 +1230,12 @@ def dedupe_detections(detections: list[dict[str, Any]], iou_threshold: float = 0
 	return kept
 
 
-def merge_close_detections(detections: list[dict[str, Any]], distance_ratio: float = 2.0) -> list[dict[str, Any]]:
+def merge_close_detections(detections: list[dict[str, Any]], distance_ratio: float = 1.0) -> list[dict[str, Any]]:
 	"""Merge detections of the same category when their centers are very close.
 
 	This helps collapse a text label and a nearby shape that refer to the same component
 	but have little IoU overlap (common in P&ID diagrams).
-	Increased distance ratio to be more aggressive in merging nearby detections.
+	Reduced distance ratio to be more aggressive in merging nearby detections and prevent overcounting.
 	"""
 	if not detections:
 		return []
@@ -812,14 +1257,387 @@ def merge_close_detections(detections: list[dict[str, Any]], distance_ratio: flo
 				continue
 			ex_c = center(ex["bbox"])
 			ex_bw = max(ex["bbox"][2], ex["bbox"][3])
-			# distance threshold relative to the larger box
-			thresh = max(bw, ex_bw) * distance_ratio
+
+			iou_score = iou(bx, ex["bbox"])
+			if iou_score > 0.6:
+				duplicate = True
+				break
+
+			thresh_ratio = distance_ratio
+			if det.get("category") == "tank":
+				thresh_ratio = min(distance_ratio, 0.25)
+			thresh = max(bw, ex_bw) * thresh_ratio
 			dist = math.hypot(bx_c[0] - ex_c[0], bx_c[1] - ex_c[1])
 			if dist <= thresh:
 				duplicate = True
 				break
+
 		if not duplicate:
 			kept.append(det)
+	return kept
+
+
+def merge_stacked_tank_symbols(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+	"""Merge vertical+horizontal parts of the same P&ID vessel into one tank detection."""
+	tanks = [d for d in detections if d.get("category") == "tank"]
+	others = [d for d in detections if d.get("category") != "tank"]
+	if len(tanks) <= 1:
+		return detections
+
+	ordered = sorted(tanks, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+	kept: list[dict[str, Any]] = []
+
+	def _x_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+		ax1, ay1, aw, ah = a
+		bx1, by1, bw, bh = b
+		ax2, bx2 = ax1 + aw, bx1 + bw
+		inter = max(0, min(ax2, bx2) - max(ax1, bx1))
+		union = aw + bw - inter
+		return inter / union if union > 0 else 0.0
+
+	for det in ordered:
+		box = det.get("bbox")
+		if not box:
+			kept.append(det)
+			continue
+		dx, dy, dw, dh = box
+		dcx, dcy = dx + dw / 2.0, dy + dh / 2.0
+		duplicate = False
+		for ex in kept:
+			ex_box = ex.get("bbox")
+			if not ex_box:
+				continue
+			ex, ey, ew, eh = ex_box
+			ecx, ecy = ex + ew / 2.0, ey + eh / 2.0
+			if _x_overlap(box, ex_box) < 0.35:
+				continue
+			# Do not merge separate horizontal drums on the same feed line.
+			if dw >= dh * 2.5 and ew >= eh * 2.5:
+				continue
+			vert_gap = abs(dcy - ecy)
+			max_dim = max(dw, dh, ew, eh)
+			if vert_gap <= max_dim * 2.5:
+				duplicate = True
+				break
+		if not duplicate:
+			kept.append(det)
+
+	return others + kept
+
+
+def consolidate_tank_vessels(
+	detections: list[dict[str, Any]],
+	image_area: float | None = None,
+) -> list[dict[str, Any]]:
+	"""Keep primary vessel(s); drop small false tank hits (controllers, caps, internals)."""
+	tanks = [d for d in detections if d.get("category") == "tank"]
+	others = [d for d in detections if d.get("category") != "tank"]
+	if len(tanks) <= 1:
+		return detections
+
+	def _size(det: dict[str, Any]) -> float:
+		box = det.get("bbox") or (0, 0, 0, 0)
+		return float(det.get("area", box[2] * box[3]))
+
+	max_size = max(_size(t) for t in tanks)
+	min_keep = max(
+		_min_tank_area(image_area),
+		max_size * 0.22,
+		(image_area or 0.0) * 0.001,
+		350.0,
+	)
+
+	kept: list[dict[str, Any]] = []
+	for det in sorted(tanks, key=_size, reverse=True):
+		if _size(det) < min_keep:
+			continue
+		box = det.get("bbox")
+		if not box:
+			kept.append(det)
+			continue
+		duplicate = False
+		for ex in kept:
+			ex_box = ex.get("bbox")
+			if not ex_box:
+				continue
+			if iou(box, ex_box) >= 0.12:
+				duplicate = True
+				break
+		if not duplicate:
+			kept.append(det)
+
+	if len(kept) <= 1:
+		return others + kept
+
+	# One horizontal drum per vertical column (feed lines repeat similar symbols).
+	column_kept: list[dict[str, Any]] = []
+	for det in sorted(kept, key=_size, reverse=True):
+		box = det.get("bbox")
+		if not box:
+			column_kept.append(det)
+			continue
+		cx = box[0] + box[2] / 2.0
+		duplicate_column = False
+		for existing in column_kept:
+			ex_box = existing.get("bbox")
+			if not ex_box:
+				continue
+			ex_cx = ex_box[0] + ex_box[2] / 2.0
+			if abs(cx - ex_cx) <= max(box[2], ex_box[2]) * 0.75:
+				duplicate_column = True
+				break
+		if not duplicate_column:
+			column_kept.append(det)
+
+	return others + column_kept
+
+
+def suppress_nearby_valves(
+	detections: list[dict[str, Any]],
+	iou_threshold: float = 0.35,
+	center_dist_ratio: float = 0.55,
+	area_ratio_min: float = 0.60,
+	area_ratio_max: float = 1.60,
+) -> list[dict[str, Any]]:
+	"""Valve-specific suppression to reduce false extra valve symbols.
+
+	Sometimes contour/OCR/template can produce multiple nearby valve-like candidates
+	that do not overlap enough for IoU-based dedupe. This function removes the
+	lower-confidence one when two valve detections are very close and similar in size.
+	"""
+	if not detections:
+		return []
+
+	def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+		x, y, w, h = box
+		return x + w / 2.0, y + h / 2.0
+
+	ordered = sorted(detections, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+	kept: list[dict[str, Any]] = []
+
+	for det in ordered:
+		if det.get("category") != "valve":
+			kept.append(det)
+			continue
+
+		box = det.get("bbox")
+		if not box:
+			kept.append(det)
+			continue
+
+		deliberate_duplicate = False
+		det_area = float(det.get("area", box[2] * box[3]))
+		det_conf = float(det.get("confidence", 0.0))
+		dx_det, dy_det = _center(box)
+
+		for ex in kept:
+			if ex.get("category") != "valve":
+				continue
+			ex_box = ex.get("bbox")
+			if not ex_box:
+				continue
+
+			ex_area = float(ex.get("area", ex_box[2] * ex_box[3]))
+			if ex_area <= 0 or det_area <= 0:
+				continue
+
+			# Area similarity guard
+			area_ratio = det_area / ex_area
+			if area_ratio < area_ratio_min or area_ratio > area_ratio_max:
+				continue
+
+			# Distance guard (relative to larger bbox dimension)
+			ex_cx, ex_cy = _center(ex_box)
+			dist = math.hypot(dx_det - ex_cx, dy_det - ex_cy)
+			max_dim = max(float(box[2]), float(box[3]), float(ex_box[2]), float(ex_box[3]))
+			if max_dim <= 0:
+				continue
+			if dist > max_dim * center_dist_ratio:
+				continue
+
+			# IoU guard: allow suppression even if IoU is low, but still
+			# require at least some spatial overlap similarity.
+			if iou(box, ex_box) >= iou_threshold:
+				deliberate_duplicate = True
+				break
+
+			# If IoU is below threshold, still suppress if extremely close.
+			# (This handles low-overlap cases where symbols are adjacent.)
+			if dist <= max_dim * (center_dist_ratio * 0.45):
+				deliberate_duplicate = True
+				break
+
+		if not deliberate_duplicate:
+			kept.append(det)
+
+	return kept
+
+
+def _is_supported_template_detection(
+	detection: dict[str, Any],
+	peer_detections: list[dict[str, Any]],
+) -> bool:
+	"""Keep template detections only when another source supports them.
+
+	Template matching improves recall, but it also creates the largest duplicate
+	bursts. A template hit is counted only if a shape, OCR, or annotation detection
+	of the same category is close enough to support it.
+	"""
+	if detection.get("source") != "template":
+		return True
+
+	box = detection.get("bbox")
+	category = detection.get("category")
+	if category not in COUNT_KEYS or not box:
+		return False
+
+	def _center(target_box: tuple[int, int, int, int]) -> tuple[float, float]:
+		x, y, w, h = target_box
+		return x + w / 2.0, y + h / 2.0
+
+	box_center = _center(box)
+	box_span = max(float(box[2]), float(box[3]))
+	if box_span <= 0:
+		return False
+
+	for peer in peer_detections:
+		if peer.get("source") == "template" or peer.get("category") != category:
+			continue
+		peer_box = peer.get("bbox")
+		if not peer_box:
+			continue
+		if iou(box, peer_box) >= 0.12:
+			return True
+		peer_center = _center(peer_box)
+		peer_span = max(float(peer_box[2]), float(peer_box[3]))
+		if peer_span <= 0:
+			continue
+		distance = math.hypot(box_center[0] - peer_center[0], box_center[1] - peer_center[1])
+		if distance <= max(box_span, peer_span) * 0.85:
+			return True
+
+	return False
+
+
+def collapse_countable_clusters(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+	"""Collapse same-category near-duplicates before counting.
+
+	This is intentionally more aggressive than the general dedupe pass because the
+	counting path should prefer undercounting a little over inflating one symbol
+	into several repeated tank or valve hits.
+	"""
+	if not detections:
+		return []
+
+	cluster_rules: dict[str, dict[str, float]] = {
+		"tank": {
+			"iou": 0.10,
+			"center": 0.85,
+			"area_min": 0.20,
+			"area_max": 5.00,
+		},
+		"valve": {
+			"iou": 0.08,
+			"center": 1.50,
+			"area_min": 0.25,
+			"area_max": 4.00,
+		},
+		"pump": {
+			"iou": 0.28,
+			"center": 0.75,
+			"area_min": 0.55,
+			"area_max": 1.85,
+		},
+		"motor": {
+			"iou": 0.28,
+			"center": 0.75,
+			"area_min": 0.55,
+			"area_max": 1.85,
+		},
+	}
+
+	def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+		x, y, w, h = box
+		return x + w / 2.0, y + h / 2.0
+
+	def _area(box: tuple[int, int, int, int]) -> float:
+		return float(max(0, box[2]) * max(0, box[3]))
+
+	def _is_neighbor(
+		first: dict[str, Any],
+		second: dict[str, Any],
+		rule: dict[str, float],
+	) -> bool:
+		first_box = first.get("bbox")
+		second_box = second.get("bbox")
+		if not first_box or not second_box:
+			return False
+
+		first_area = float(first.get("area", _area(first_box)))
+		second_area = float(second.get("area", _area(second_box)))
+		if first_area <= 0.0 or second_area <= 0.0:
+			return False
+
+		area_ratio = first_area / second_area
+		if area_ratio < rule["area_min"] or area_ratio > rule["area_max"]:
+			return False
+
+		if iou(first_box, second_box) >= rule["iou"]:
+			return True
+
+		first_center = _center(first_box)
+		second_center = _center(second_box)
+		max_dim = max(float(first_box[2]), float(first_box[3]), float(second_box[2]), float(second_box[3]))
+		if max_dim <= 0:
+			return False
+		distance = math.hypot(first_center[0] - second_center[0], first_center[1] - second_center[1])
+		return distance <= max_dim * rule["center"]
+
+	ordered = sorted(detections, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+	by_category: dict[str, list[dict[str, Any]]] = {key: [] for key in cluster_rules}
+	others: list[dict[str, Any]] = []
+	for det in ordered:
+		category = det.get("category")
+		if category in by_category and det.get("bbox"):
+			by_category[category].append(det)
+		else:
+			others.append(det)
+
+	kept: list[dict[str, Any]] = list(others)
+
+	for category, items in by_category.items():
+		if len(items) <= 1:
+			kept.extend(items)
+			continue
+
+		rule = cluster_rules[category]
+		parent = list(range(len(items)))
+
+		def find(index: int) -> int:
+			while parent[index] != index:
+				parent[index] = parent[parent[index]]
+				index = parent[index]
+			return index
+
+		def union(left: int, right: int) -> None:
+			left_root = find(left)
+			right_root = find(right)
+			if left_root != right_root:
+				parent[right_root] = left_root
+
+		for left in range(len(items)):
+			for right in range(left + 1, len(items)):
+				if _is_neighbor(items[left], items[right], rule):
+					union(left, right)
+
+		clusters: dict[int, list[dict[str, Any]]] = {}
+		for index, det in enumerate(items):
+			clusters.setdefault(find(index), []).append(det)
+
+		for cluster_items in clusters.values():
+			cluster_items.sort(key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+			kept.append(cluster_items[0])
+
 	return kept
 
 
@@ -841,45 +1659,107 @@ def merge_counts_with_text_anchors(
 	visual_counts: dict[str, int],
 	text_counts: dict[str, int],
 ) -> dict[str, int]:
-	"""Merge counts so explicit text tags anchor pump/valve counts, while visual detections
-	still contribute to motor/tank where text is often incomplete.
+	"""Merge OCR and visual counts; drawable symbols beat tag-only mentions.
+
+	text_counts is kept for Ollama hints but does not inflate totals on its own.
 	"""
-	merged = empty_counts()
-	for key in COUNT_KEYS:
-		ocr_value = int(ocr_counts.get(key, 0))
-		visual_value = int(visual_counts.get(key, 0))
-		text_value = int(text_counts.get(key, 0))
-		if key in {"pump", "valve"}:
-			# Explicit tags are much more reliable for these categories.
-			# Cap OCR/visual spikes relative to explicit text anchors to avoid severe overcounts.
-			if text_value > 0:
-				cap = text_value + 1
-				merged[key] = max(text_value, min(ocr_value, cap), min(visual_value, cap))
-			else:
-				merged[key] = max(ocr_value, visual_value)
-		else:
-			merged[key] = max(ocr_value, visual_value, text_value)
-	return merged
+	_ = text_counts
+	return build_counts(ocr_counts, visual_counts)
+
+
+def filter_valve_geometry_false_positives(
+	detections: list[dict[str, Any]],
+	ocr_detections: list[dict[str, Any]],
+	image_height: int | None = None,
+) -> list[dict[str, Any]]:
+	"""Drop valve hits that are elongated line/instrument blobs without a valve tag."""
+	filtered: list[dict[str, Any]] = []
+	for det in detections:
+		if det.get("category") != "valve":
+			filtered.append(det)
+			continue
+		box = det.get("bbox")
+		if not box:
+			continue
+		center_y = box[1] + box[3] / 2.0
+		confidence = float(det.get("confidence", 0.0) or 0.0)
+		try:
+			nearby_text = " ".join(item.get("text", "") for item in nearby_ocr_texts(box, ocr_detections, padding_ratio=0.45))
+		except Exception:
+			nearby_text = ""
+		if _VALVE_TAG_RE.search(nearby_text or ""):
+			filtered.append(det)
+			continue
+		# Drop round instrument bubbles in the upper sheet only (not bow-tie valves).
+		if (
+			image_height is not None
+			and image_height > 0
+			and center_y < image_height * 0.42
+			and confidence < 0.76
+			and float(det.get("circularity", 0.0) or 0.0) > 0.52
+		):
+			continue
+		area = float(det.get("area", box[2] * box[3]))
+		aspect_ratio = float(det.get("aspect_ratio", box[2] / max(box[3], 1)))
+		if _is_compact_bowtie_valve(
+			area,
+			aspect_ratio,
+			float(det.get("circularity", 0.0) or 0.0),
+			int(det.get("vertex_count", 0) or 0),
+			float(det.get("extent", 0.0) or 0.0),
+			float(det.get("solidity", 0.0) or 0.0),
+			bbox=box,
+		):
+			filtered.append(det)
+	return filtered
+
+
+def clear_annotation_templates_cache() -> None:
+	"""Call after new component reference images are saved."""
+	load_annotation_templates.cache_clear()
+
+
+def count_detections_by_category(
+	detections: list[dict[str, Any]],
+	thresholds: dict[str, float] | None = None,
+) -> dict[str, int]:
+	"""Count detections that pass per-category confidence thresholds."""
+	thresh = thresholds or CONF_THRESH
+	counts = empty_counts()
+	for det in detections:
+		category = det.get("category")
+		if category not in counts:
+			continue
+		conf = float(det.get("confidence", 0.0) or 0.0)
+		if conf >= thresh.get(category, 0.45):
+			counts[category] += 1
+	return counts
 
 
 @lru_cache(maxsize=1)
 def load_annotation_templates() -> dict[str, list[tuple[np.ndarray, str]]]:
-	"""Load template images from Backend/annotations and group by category suffix.
+	"""Load a small set of newest reference images per category for template matching.
 
-	Returns a dict: category -> list of (template_image_gray, filename)
+	The annotations folder accumulates every uploaded sample; matching against hundreds
+	of templates per P&ID is too slow, so we keep only the most recent few per type.
 	"""
 	templates_dir = Path(__file__).resolve().parents[1] / "annotations"
-	out: dict[str, list[tuple[np.ndarray, str]]] = {}
+	by_category: dict[str, list[tuple[float, np.ndarray, str]]] = {}
 	if not templates_dir.exists():
-		return out
-	for p in sorted(templates_dir.iterdir()):
+		logger.warning(f"Annotations directory not found: {templates_dir}")
+		return {}
+	
+	logger.info(f"Loading annotation templates from: {templates_dir}")
+	
+	for p in sorted(templates_dir.iterdir()):  # Sort for deterministic loading
 		if not p.is_file():
 			continue
 		name = p.name.lower()
-		# Expect filenames like '*_valve.png', '*_tank.png', etc.
 		category = None
+		# More flexible pattern matching for annotation filenames
 		for cat in ("valve", "tank", "pump", "motor"):
-			if f"_{cat}" in name or name.endswith(f"{cat}.png") or name.endswith(f"{cat}.jpg"):
+			# Match patterns like: "_valve", "valve.png", "valve.jpg", "valve", "valves", "pumps", "motors", "tanks"
+			if f"_{cat}" in name or f"_{cat}s" in name or name.endswith(f"{cat}.png") or name.endswith(f"{cat}.jpg") or name.endswith(f"{cat}s.png") or name.startswith(f"{cat}"):
 				category = cat
 				break
 		if not category:
@@ -887,18 +1767,69 @@ def load_annotation_templates() -> dict[str, list[tuple[np.ndarray, str]]]:
 		try:
 			img = cv2.imdecode(np.fromfile(str(p), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
 			if img is None:
+				logger.warning(f"Failed to load image: {p.name}")
 				continue
-		except Exception:
+		except Exception as e:
+			logger.warning(f"Error loading image {p.name}: {e}")
 			try:
 				with Image.open(p) as im:
-					img = cv2.cvtColor(np.array(im.convert("L")), cv2.COLOR_GRAY2BGR)[:, :, 0]
-			except Exception:
+					img = np.array(im.convert("L"), dtype=np.uint8)
+			except Exception as e2:
+				logger.warning(f"Error loading image {p.name} with PIL: {e2}")
 				continue
-		out.setdefault(category, []).append((img, p.name))
+		try:
+			mtime = p.stat().st_mtime
+		except OSError:
+			mtime = 0.0
+		by_category.setdefault(category, []).append((mtime, img, p.name))
+
+	out: dict[str, list[tuple[np.ndarray, str]]] = {}
+	for category, items in by_category.items():
+		items.sort(key=lambda row: row[0], reverse=True)
+		trimmed = items[:TEMPLATE_MAX_PER_CATEGORY]
+		out[category] = [(img, fname) for _mtime, img, fname in trimmed]
+		logger.info(f"Loaded {len(out[category])} {category} templates")
+	
+	total_templates = sum(len(v) for v in out.values())
+	logger.info(f"Total annotation templates loaded: {total_templates}")
 	return out
 
 
-def match_annotation_templates(image_array: np.ndarray, templates: dict[str, list[tuple[np.ndarray, str]]], threshold: float = 0.62) -> list[dict[str, Any]]:
+def _template_match_peaks(
+	result: np.ndarray,
+	tmpl_w: int,
+	tmpl_h: int,
+	threshold: float,
+	max_peaks: int,
+) -> list[tuple[int, int, float]]:
+	"""Return up to max_peaks (x, y, score) local maxima without scanning every pixel."""
+	peaks: list[tuple[int, int, float]] = []
+	if result.size == 0:
+		return peaks
+	work = result.copy()
+	pad_x = max(4, tmpl_w // 2)
+	pad_y = max(4, tmpl_h // 2)
+	for _ in range(max_peaks):
+		_, max_val, _, max_loc = cv2.minMaxLoc(work)
+		if max_val < threshold:
+			break
+		x, y = int(max_loc[0]), int(max_loc[1])
+		peaks.append((x, y, float(max_val)))
+		x1 = max(0, x - pad_x)
+		y1 = max(0, y - pad_y)
+		x2 = min(work.shape[1], x + pad_x)
+		y2 = min(work.shape[0], y + pad_y)
+		work[y1:y2, x1:x2] = 0.0
+	return peaks
+
+
+def match_annotation_templates(
+	image_array: np.ndarray,
+	templates: dict[str, list[tuple[np.ndarray, str]]],
+	threshold: float = 0.55,
+	*,
+	extended_scales: bool = False,
+) -> list[dict[str, Any]]:
 	"""Template-match annotation templates against the image and return detections.
 
 	Returns list of detection dicts similar to shape detection output.
@@ -906,35 +1837,50 @@ def match_annotation_templates(image_array: np.ndarray, templates: dict[str, lis
 	if not templates:
 		return []
 	gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+	orig_h, orig_w = gray.shape[:2]
+	scale_down = 1.0
+	if max(orig_h, orig_w) > TEMPLATE_MATCH_MAX_EDGE:
+		scale_down = float(TEMPLATE_MATCH_MAX_EDGE) / float(max(orig_h, orig_w))
+		gray = cv2.resize(
+			gray,
+			(int(orig_w * scale_down), int(orig_h * scale_down)),
+			interpolation=cv2.INTER_AREA,
+		)
+
 	detections: list[dict[str, Any]] = []
-	scales = [0.5, 0.75, 1.0, 1.25, 1.5]
-	for category, tmpl_list in templates.items():
+	# Expert-level: Very granular scales for maximum multi-scale detection accuracy
+	scales = [0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15, 1.25, 1.4, 1.55, 1.7, 1.85, 2.0, 2.2, 2.4] if extended_scales else [0.4, 0.55, 0.7, 0.85, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+	used_bins: set[tuple[str, int, int, int, int]] = set()
+
+	# Process categories in sorted order for deterministic results
+	for category in sorted(templates.keys()):
+		tmpl_list = templates[category]
 		for tmpl, fname in tmpl_list:
 			th, tw = tmpl.shape[:2]
-			used = set()
 			for scale in scales:
-				sw = max(1, int(tw * scale))
-				sh = max(1, int(th * scale))
+				sw = max(1, int(tw * scale * scale_down))
+				sh = max(1, int(th * scale * scale_down))
 				if sh >= gray.shape[0] or sw >= gray.shape[1]:
 					continue
 				try:
 					tmpl_resized = cv2.resize(tmpl, (sw, sh), interpolation=cv2.INTER_AREA)
-				except Exception:
-					continue
-				try:
 					res = cv2.matchTemplate(gray, tmpl_resized, cv2.TM_CCOEFF_NORMED)
 				except Exception:
 					continue
-				# pick local maxima above threshold
-				loc = np.where(res >= threshold)
-				for y, x in zip(*loc):
-					score = float(res[y, x])
-					bx, by, bw, bh = int(x), int(y), int(tmpl_resized.shape[1]), int(tmpl_resized.shape[0])
-					# simple dedupe by spatial binning
-					key = (category, bx // 8, by // 8, bw // 8, bh // 8)
-					if key in used:
+				for x, y, score in _template_match_peaks(
+					res, sw, sh, threshold, TEMPLATE_MAX_PEAKS
+				):
+					if scale_down < 1.0:
+						bx = int(x / scale_down)
+						by = int(y / scale_down)
+						bw = max(1, int(sw / scale_down))
+						bh = max(1, int(sh / scale_down))
+					else:
+						bx, by, bw, bh = x, y, sw, sh
+					key = (category, bx // 10, by // 10, bw // 10, bh // 10)
+					if key in used_bins:
 						continue
-					used.add(key)
+					used_bins.add(key)
 					detections.append(
 						{
 							"name": f"{category.title()} (template:{fname})",
@@ -952,28 +1898,720 @@ def match_annotation_templates(image_array: np.ndarray, templates: dict[str, lis
 	return detections
 
 
+def match_features_with_orb(
+	image_array: np.ndarray,
+	templates: dict[str, list[tuple[np.ndarray, str]]],
+	min_matches: int = 8,
+	*,
+	extended_scales: bool = False,
+) -> list[dict[str, Any]]:
+	"""Feature-based matching using ORB for robust component detection.
+	
+	Uses ORB feature matching to detect components that may not match well with
+	template matching due to rotation, scale, or partial occlusion.
+	
+	Returns list of detection dicts similar to shape detection output.
+	"""
+	if not templates:
+		return []
+	
+	try:
+		orb = cv2.ORB_create(nfeatures=2000, scoreType=cv2.ORB_FAST_SCORE)
+		bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+	except Exception:
+		logger.warning("ORB feature matching not available, skipping")
+		return []
+	
+	gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+	orig_h, orig_w = gray.shape[:2]
+	scale_down = 1.0
+	if max(orig_h, orig_w) > TEMPLATE_MATCH_MAX_EDGE:
+		scale_down = float(TEMPLATE_MATCH_MAX_EDGE) / float(max(orig_h, orig_w))
+		gray = cv2.resize(
+			gray,
+			(int(orig_w * scale_down), int(orig_h * scale_down)),
+			interpolation=cv2.INTER_AREA,
+		)
+	
+	# Detect keypoints in the target image
+	try:
+		kp_target, des_target = orb.detectAndCompute(gray, None)
+		if des_target is None or len(kp_target) < min_matches:
+			return []
+	except Exception:
+		return []
+	
+	detections: list[dict[str, Any]] = []
+	# Expert-level: More granular scales for better feature matching across sizes
+	scales = [0.5, 0.65, 0.8, 0.95, 1.1, 1.3, 1.5, 1.75, 2.0, 2.3] if extended_scales else [0.6, 0.8, 1.0, 1.25, 1.5, 1.8]
+	used_bins: set[tuple[str, int, int, int, int]] = set()
+	
+	for category in sorted(templates.keys()):
+		tmpl_list = templates[category]
+		for tmpl, fname in tmpl_list:
+			th, tw = tmpl.shape[:2]
+			
+			for scale in scales:
+				sw = max(1, int(tw * scale * scale_down))
+				sh = max(1, int(th * scale * scale_down))
+				if sh >= gray.shape[0] or sw >= gray.shape[1]:
+					continue
+				
+				try:
+					tmpl_resized = cv2.resize(tmpl, (sw, sh), interpolation=cv2.INTER_AREA)
+					kp_tmpl, des_tmpl = orb.detectAndCompute(tmpl_resized, None)
+					if des_tmpl is None or len(kp_tmpl) < 4:
+						continue
+					
+					# Match features
+					matches = bf.knnMatch(des_tmpl, des_target, k=2)
+					
+					# Apply Lowe's ratio test
+					good_matches = []
+					for match_pair in matches:
+						if len(match_pair) == 2:
+							m, n = match_pair
+							if m.distance < 0.75 * n.distance:
+								good_matches.append(m)
+					
+					if len(good_matches) < min_matches:
+						continue
+					
+					# Extract location of good matches
+					src_pts = np.float32([kp_tmpl[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+					dst_pts = np.float32([kp_target[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+					
+					# Find homography to locate the template in the image
+					M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+					if M is None:
+						continue
+					
+					# Get the bounding box of the matched region
+					h, w = tmpl_resized.shape[:2]
+					pts = np.float32([[0, 0], [0, h-1], [w-1, h-1], [w-1, 0]]).reshape(-1, 1, 2)
+					dst = cv2.perspectiveTransform(pts, M)
+					
+					# Calculate bounding box from transformed corners
+					x_coords = [int(p[0][0]) for p in dst]
+					y_coords = [int(p[0][1]) for p in dst]
+					bx, by = min(x_coords), min(y_coords)
+					bw = max(x_coords) - bx
+					bh = max(y_coords) - by
+					
+					if bw < 10 or bh < 10:
+					 continue
+					
+					# Scale back to original image coordinates
+					if scale_down < 1.0:
+						bx = int(bx / scale_down)
+						by = int(by / scale_down)
+						bw = int(bw / scale_down)
+						bh = int(bh / scale_down)
+					
+					key = (category, bx // 10, by // 10, bw // 10, bh // 10)
+					if key in used_bins:
+						continue
+					used_bins.add(key)
+					
+					# Calculate confidence based on match quality
+					inliers = np.sum(mask)
+					confidence = min(0.95, float(inliers) / len(good_matches) + 0.5)
+					
+					detections.append(
+						{
+							"name": f"{category.title()} (feature:{fname})",
+							"category": category,
+							"bbox": (bx, by, bw, bh),
+							"confidence": confidence,
+							"area": bw * bh,
+							"circularity": 0.0,
+							"aspect_ratio": float(bw) / max(1.0, float(bh)),
+							"vertex_count": 0,
+							"extent": 0.0,
+							"solidity": 0.0,
+						}
+					)
+				except Exception:
+					continue
+	
+	return detections
+
+
+def ensemble_vote_detections(
+	template_detections: list[dict[str, Any]],
+	feature_detections: list[dict[str, Any]],
+	shape_detections: list[dict[str, Any]],
+	ssim_detections: list[dict[str, Any]] | None = None,
+	edge_detections: list[dict[str, Any]] | None = None,
+	iou_threshold: float = 0.30,
+) -> list[dict[str, Any]]:
+	"""Combine detections from multiple methods using ensemble voting.
+	
+	This function merges detections from template matching, feature matching,
+	shape detection, SSIM matching, and edge detection, using voting to improve
+	accuracy and reduce false positives.
+	
+	Returns a consolidated list of detections with boosted confidence for
+	components detected by multiple methods.
+	"""
+	all_detections = []
+	
+	# Add source tags to track which method detected each component
+	for det in template_detections:
+		det_copy = det.copy()
+		det_copy["sources"] = det_copy.get("sources", set()) | {"template"}
+		all_detections.append(det_copy)
+	
+	for det in feature_detections:
+		det_copy = det.copy()
+		det_copy["sources"] = det_copy.get("sources", set()) | {"feature"}
+		all_detections.append(det_copy)
+	
+	for det in shape_detections:
+		det_copy = det.copy()
+		det_copy["sources"] = det_copy.get("sources", set()) | {"shape"}
+		all_detections.append(det_copy)
+	
+	if ssim_detections:
+		for det in ssim_detections:
+			det_copy = det.copy()
+			det_copy["sources"] = det_copy.get("sources", set()) | {"ssim"}
+			all_detections.append(det_copy)
+	
+	if edge_detections:
+		for det in edge_detections:
+			det_copy = det.copy()
+			det_copy["sources"] = det_copy.get("sources", set()) | {"edge"}
+			all_detections.append(det_copy)
+	
+	if not all_detections:
+		return []
+	
+	# Sort by confidence
+	all_detections.sort(key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+	
+	# Group detections by spatial proximity and category
+	groups: list[list[dict[str, Any]]] = []
+	
+	for det in all_detections:
+		box = det.get("bbox")
+		category = det.get("category")
+		if not box or not category:
+			continue
+		
+		assigned = False
+		for group in groups:
+			# Check if this detection belongs to an existing group
+			for member in group:
+				if member.get("category") != category:
+					continue
+				member_box = member.get("bbox")
+				if member_box and iou(box, member_box) >= iou_threshold:
+					group.append(det)
+					assigned = True
+					break
+			if assigned:
+				break
+		
+		if not assigned:
+			groups.append([det])
+	
+	# Merge each group into a single detection
+	merged_detections: list[dict[str, Any]] = []
+	
+	for group in groups:
+		if not group:
+			continue
+		
+		# Use the detection with highest confidence as base
+		base = max(group, key=lambda d: float(d.get("confidence", 0.0)))
+		merged = base.copy()
+		
+		# Boost confidence based on number of detection methods
+		sources = set()
+		for det in group:
+			sources.update(det.get("sources", set()))
+		
+		source_count = len(sources)
+		base_confidence = float(base.get("confidence", 0.0))
+		
+		# Expert-level: Weighted confidence boost based on method reliability
+		# SSIM and template matching are most reliable, feature matching second, shape detection third, edge fourth
+		method_weights = {"template": 1.0, "ssim": 1.0, "feature": 0.8, "shape": 0.6, "edge": 0.7}
+		weighted_boost = sum(method_weights.get(s, 0.5) for s in sources) / len(sources)
+		confidence_boost = min(0.35, weighted_boost * 0.18)
+		merged["confidence"] = min(0.99, base_confidence + confidence_boost)
+		
+		# Update source indicator
+		merged["source"] = "ensemble"
+		merged["sources"] = sources
+		
+		# Average bounding box if multiple detections
+		if len(group) > 1:
+			boxes = [d.get("bbox") for d in group if d.get("bbox")]
+			if boxes:
+				avg_x = sum(b[0] for b in boxes) / len(boxes)
+				avg_y = sum(b[1] for b in boxes) / len(boxes)
+				avg_w = sum(b[2] for b in boxes) / len(boxes)
+				avg_h = sum(b[3] for b in boxes) / len(boxes)
+				merged["bbox"] = (int(avg_x), int(avg_y), int(avg_w), int(avg_h))
+				merged["area"] = avg_w * avg_h
+		
+		merged_detections.append(merged)
+	
+	return merged_detections
+
+
+def calculate_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
+	"""Calculate Structural Similarity Index (SSIM) between two images.
+	
+	SSIM is a perception-based model that considers image degradation as
+	perceived change in structural information, providing better similarity
+	assessment than simple correlation for template matching.
+	"""
+	try:
+		# Convert to grayscale if needed
+		if len(img1.shape) == 3:
+			img1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
+		if len(img2.shape) == 3:
+			img2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
+		
+		# Resize to same dimensions
+		if img1.shape != img2.shape:
+			img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+		
+		# Calculate SSIM
+		C1 = (0.01 * 255) ** 2
+		C2 = (0.03 * 255) ** 2
+		
+		mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
+		mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
+		
+		mu1_sq = mu1 * mu1
+		mu2_sq = mu2 * mu2
+		mu1_mu2 = mu1 * mu2
+		
+		sigma1_sq = cv2.GaussianBlur(img1 * img1, (11, 11), 1.5) - mu1_sq
+		sigma2_sq = cv2.GaussianBlur(img2 * img2, (11, 11), 1.5) - mu2_sq
+		sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
+		
+		ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+		
+		return float(np.mean(ssim_map))
+	except Exception:
+		return 0.0
+
+
+def match_with_ssim(
+	image_array: np.ndarray,
+	templates: dict[str, list[tuple[np.ndarray, str]]],
+	threshold: float = 0.60,
+	*,
+	extended_scales: bool = False,
+) -> list[dict[str, Any]]:
+	"""Template matching using SSIM for better structural similarity assessment.
+	
+	Uses Structural Similarity Index instead of normalized cross-correlation,
+	providing better matching for components with similar structure but different
+	contrast or brightness.
+	"""
+	if not templates:
+		return []
+	
+	gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+	orig_h, orig_w = gray.shape[:2]
+	scale_down = 1.0
+	if max(orig_h, orig_w) > TEMPLATE_MATCH_MAX_EDGE:
+		scale_down = float(TEMPLATE_MATCH_MAX_EDGE) / float(max(orig_h, orig_w))
+		gray = cv2.resize(
+			gray,
+			(int(orig_w * scale_down), int(orig_h * scale_down)),
+			interpolation=cv2.INTER_AREA,
+		)
+	
+	detections: list[dict[str, Any]] = []
+	# Expert-level: Very granular scales for maximum multi-scale detection accuracy
+	scales = [0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15, 1.25, 1.4, 1.55, 1.7, 1.85, 2.0, 2.2, 2.4] if extended_scales else [0.4, 0.55, 0.7, 0.85, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+	used_bins: set[tuple[str, int, int, int, int]] = set()
+	
+	for category in sorted(templates.keys()):
+		tmpl_list = templates[category]
+		for tmpl, fname in tmpl_list:
+			th, tw = tmpl.shape[:2]
+			
+			for scale in scales:
+				sw = max(1, int(tw * scale * scale_down))
+				sh = max(1, int(th * scale * scale_down))
+				
+				# Slide window across image
+				for y in range(0, gray.shape[0] - sh + 1, max(1, sh // 4)):
+					for x in range(0, gray.shape[1] - sw + 1, max(1, sw // 4)):
+						roi = gray[y:y+sh, x:x+sw]
+						
+						# Resize template to match ROI
+						tmpl_resized = cv2.resize(tmpl, (sw, sh))
+						if len(tmpl_resized.shape) == 3:
+							tmpl_resized = cv2.cvtColor(tmpl_resized, cv2.COLOR_RGB2GRAY)
+						
+						# Calculate SSIM
+						ssim_score = calculate_ssim(roi, tmpl_resized)
+						
+						if ssim_score >= threshold:
+							# Convert back to original coordinates
+							orig_x = int(x / scale_down)
+							orig_y = int(y / scale_down)
+							orig_w = int(sw / scale_down)
+							orig_h = int(sh / scale_down)
+							
+							bin_key = (category, orig_x // 20, orig_y // 20, orig_w // 20, orig_h // 20)
+							if bin_key in used_bins:
+								continue
+							used_bins.add(bin_key)
+							
+							detections.append({
+								"category": category,
+								"name": category.title(),
+								"bbox": (orig_x, orig_y, orig_w, orig_h),
+								"confidence": ssim_score,
+								"source": "ssim_template",
+								"template_file": fname,
+								"area": orig_w * orig_h,
+							})
+	
+	return detections
+
+
+def calculate_adaptive_confidence(
+	detection: dict[str, Any],
+	ocr_detections: list[dict[str, Any]],
+	image_width: int,
+	image_height: int,
+) -> float:
+	"""Calculate adaptive confidence based on multiple factors.
+	
+	Considers:
+	- Base confidence from detection method
+	- OCR support (text labels nearby)
+	- Geometry consistency
+	- Spatial context
+	- Detection method reliability
+	
+	Returns adjusted confidence score.
+	"""
+	base_confidence = float(detection.get("confidence", 0.0))
+	category = detection.get("category", "")
+	bbox = detection.get("bbox")
+	
+	if not bbox:
+		return base_confidence
+	
+	# Factor 1: OCR support
+	nearby_ocr = nearby_ocr_texts(bbox, ocr_detections)
+	ocr_support = 0.0
+	if nearby_ocr:
+		normalized_text = " ".join(item["normalized_text"] for item in nearby_ocr)
+		text_category = classify_text_label(normalized_text)
+		if text_category == category:
+			ocr_support = 0.15
+		elif text_category:
+			ocr_support = -0.10  # Mismatch reduces confidence
+	
+	# Factor 2: Geometry consistency
+	geometry_score = 0.0
+	area = float(detection.get("area", 0))
+	aspect_ratio = float(detection.get("aspect_ratio", 1.0))
+	extent = float(detection.get("extent", 0.0))
+	solidity = float(detection.get("solidity", 0.0))
+	circularity = float(detection.get("circularity", 0.0))
+	
+	if category == "tank":
+		if circularity > 0.65:
+			geometry_score = 0.10
+		elif aspect_ratio >= 1.5 and solidity >= 0.35:
+			geometry_score = 0.08
+		elif extent >= 0.30:
+			geometry_score = 0.05
+	elif category == "valve":
+		if circularity < 0.50 and solidity < 0.85:
+			geometry_score = 0.08
+		elif aspect_ratio >= 0.5 and aspect_ratio <= 2.0:
+			geometry_score = 0.05
+	elif category in ["motor", "pump"]:
+		if area >= 200 and area <= 5000:
+			geometry_score = 0.05
+	
+	# Factor 3: Detection method reliability
+	source = detection.get("source", "")
+	method_reliability = 0.0
+	if source in ["template", "ssim"]:
+		method_reliability = 0.10
+	elif source == "feature":
+		method_reliability = 0.08
+	elif source == "edge":
+		method_reliability = 0.06
+	elif source == "ensemble":
+		method_reliability = 0.12
+	
+	# Factor 4: Spatial context (position in image)
+	center_x = bbox[0] + bbox[2] / 2.0
+	center_y = bbox[1] + bbox[3] / 2.0
+	position_score = 0.0
+	
+	# Components in center region are more likely to be real
+	if 0.2 < center_x / image_width < 0.8 and 0.2 < center_y / image_height < 0.8:
+		position_score = 0.03
+	
+	# Factor 5: Size appropriateness
+	size_score = 0.0
+	image_area = image_width * image_height
+	if 0.0005 < area / image_area < 0.02:
+		size_score = 0.05
+	
+	# Combine all factors
+	adjusted_confidence = base_confidence + ocr_support + geometry_score + method_reliability + position_score + size_score
+	
+	# Clamp to valid range
+	return max(0.0, min(0.99, adjusted_confidence))
+
+
+def apply_context_aware_classification(
+	detections: list[dict[str, Any]],
+	image_width: int,
+	image_height: int,
+) -> list[dict[str, Any]]:
+	"""Apply context-aware classification to improve accuracy.
+	
+	This function analyzes spatial relationships and component density
+	to reclassify components based on their context, similar to how
+	Claude AI understands diagram semantics.
+	
+	Returns a list of detections with potentially updated categories and confidence.
+	"""
+	if not detections:
+		return detections
+	
+	# Analyze component density and spatial distribution
+	component_centers = []
+	category_counts = {"motor": 0, "pump": 0, "tank": 0, "valve": 0}
+	
+	for det in detections:
+		category = det.get("category")
+		if category in category_counts:
+			category_counts[category] += 1
+		bbox = det.get("bbox")
+		if bbox:
+			center_x = bbox[0] + bbox[2] / 2.0
+			center_y = bbox[1] + bbox[3] / 2.0
+			component_centers.append((center_x, center_y, category))
+	
+	# If very few components, no context to apply
+	if len(component_centers) < 3:
+		return detections
+	
+	# Calculate spatial clusters
+	updated_detections = []
+	for det in detections:
+		category = det.get("category")
+		bbox = det.get("bbox")
+		confidence = float(det.get("confidence", 0.0))
+		
+		if not bbox:
+			updated_detections.append(det)
+			continue
+		
+		center_x = bbox[0] + bbox[2] / 2.0
+		center_y = bbox[1] + bbox[3] / 2.0
+		
+		# Count nearby components of each category
+		nearby_categories = {"motor": 0, "pump": 0, "tank": 0, "valve": 0}
+		search_radius = min(image_width, image_height) * 0.15
+		
+		for cx, cy, cat in component_centers:
+			distance = math.hypot(center_x - cx, center_y - cy)
+			if distance <= search_radius and cat in nearby_categories:
+				nearby_categories[cat] += 1
+		
+		# Context-aware reclassification rules
+		updated_det = det.copy()
+		
+		# If a component is surrounded by many tanks and has low confidence, it might be a tank
+		if confidence < 0.50 and nearby_categories["tank"] >= 2 and category != "tank":
+			# Check if geometry is tank-like
+			area = float(det.get("area", 0))
+			aspect_ratio = float(det.get("aspect_ratio", 1.0))
+			extent = float(det.get("extent", 0.0))
+			solidity = float(det.get("solidity", 0.0))
+			
+			# Simple tank geometry check
+			if (aspect_ratio >= 1.5 or extent >= 0.25) and solidity >= 0.30:
+				updated_det["category"] = "tank"
+				updated_det["name"] = "Tank (context)"
+				updated_det["confidence"] = min(0.65, confidence + 0.20)
+		
+		# If a component is near many valves and has valve-like geometry, boost confidence
+		if category == "valve" and nearby_categories["valve"] >= 1:
+			if confidence < 0.70:
+				updated_det["confidence"] = min(0.75, confidence + 0.15)
+		
+		# If a tank is isolated (no nearby tanks) but has low confidence, reduce confidence
+		if category == "tank" and nearby_categories["tank"] == 0 and confidence < 0.60:
+			updated_det["confidence"] = max(0.40, confidence - 0.10)
+		
+		updated_detections.append(updated_det)
+	
+	return updated_detections
+
+
+def match_edges_template(
+	image_array: np.ndarray,
+	templates: dict[str, list[tuple[np.ndarray, str]]],
+	threshold: float = 0.50,
+	*,
+	extended_scales: bool = False,
+) -> list[dict[str, Any]]:
+	"""Edge-based template matching for better shape matching.
+	
+	Uses Canny edge detection before template matching to focus on structural
+	features rather than pixel intensities, making matching more robust to
+	lighting and contrast variations.
+	
+	Returns list of detection dicts similar to shape detection output.
+	"""
+	if not templates:
+		return []
+	
+	gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+	orig_h, orig_w = gray.shape[:2]
+	scale_down = 1.0
+	if max(orig_h, orig_w) > TEMPLATE_MATCH_MAX_EDGE:
+		scale_down = float(TEMPLATE_MATCH_MAX_EDGE) / float(max(orig_h, orig_w))
+		gray = cv2.resize(
+			gray,
+			(int(orig_w * scale_down), int(orig_h * scale_down)),
+			interpolation=cv2.INTER_AREA,
+		)
+	
+	# Apply Canny edge detection to both image and templates
+	try:
+		edges = cv2.Canny(gray, 50, 150)
+	except Exception:
+		return []
+	
+	detections: list[dict[str, Any]] = []
+	# Expert-level: Very granular scales for maximum multi-scale detection accuracy
+	scales = [0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15, 1.25, 1.4, 1.55, 1.7, 1.85, 2.0, 2.2, 2.4] if extended_scales else [0.4, 0.55, 0.7, 0.85, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+	used_bins: set[tuple[str, int, int, int, int]] = set()
+	
+	for category in sorted(templates.keys()):
+		tmpl_list = templates[category]
+		for tmpl, fname in tmpl_list:
+			th, tw = tmpl.shape[:2]
+			
+			for scale in scales:
+				sw = max(1, int(tw * scale * scale_down))
+				sh = max(1, int(th * scale * scale_down))
+				if sh >= gray.shape[0] or sw >= gray.shape[1]:
+					continue
+				
+				try:
+					tmpl_resized = cv2.resize(tmpl, (sw, sh), interpolation=cv2.INTER_AREA)
+					tmpl_edges = cv2.Canny(tmpl_resized, 50, 150)
+					
+					# Use normalized cross-correlation for edge matching
+					res = cv2.matchTemplate(edges, tmpl_edges, cv2.TM_CCOEFF_NORMED)
+				except Exception:
+					continue
+				
+				for x, y, score in _template_match_peaks(
+					res, sw, sh, threshold, TEMPLATE_MAX_PEAKS
+				):
+					if scale_down < 1.0:
+						bx = int(x / scale_down)
+						by = int(y / scale_down)
+						bw = max(1, int(sw / scale_down))
+						bh = max(1, int(sh / scale_down))
+					else:
+						bx, by, bw, bh = x, y, sw, sh
+					
+					key = (category, bx // 10, by // 10, bw // 10, bh // 10)
+					if key in used_bins:
+						continue
+					used_bins.add(key)
+					
+					detections.append(
+						{
+							"name": f"{category.title()} (edge:{fname})",
+							"category": category,
+							"bbox": (bx, by, bw, bh),
+							"confidence": score,
+							"area": bw * bh,
+							"circularity": 0.0,
+							"aspect_ratio": float(bw) / max(1.0, float(bh)),
+							"vertex_count": 0,
+							"extent": 0.0,
+							"solidity": 0.0,
+						}
+					)
+	return detections
+
+
 def parse_json_object(raw_text: str) -> dict[str, Any] | None:
-	trimmed = raw_text.strip()
-	for candidate in (
-		trimmed,
-		re.sub(r"^```(?:json)?\s*|\s*```$", "", trimmed, flags=re.IGNORECASE | re.DOTALL),
-	):
+	"""Parse a JSON object from model output.
+
+	Accepts: raw JSON, fenced JSON, or JSON embedded within text.
+	"""
+	trimmed = (raw_text or "").strip()
+	if not trimmed:
+		return None
+
+	def _try(candidate: str) -> dict[str, Any] | None:
+		candidate = candidate.strip()
+		if not candidate:
+			return None
 		try:
 			parsed = json.loads(candidate)
 			if isinstance(parsed, dict):
 				return parsed
 		except json.JSONDecodeError:
-			continue
+			return None
+		return None
+
+	for candidate in (
+		trimmed,
+		re.sub(r"^```(?:json)?\s*|\s*```$", "", trimmed, flags=re.IGNORECASE | re.DOTALL),
+	):
+		parsed = _try(candidate)
+		if parsed is not None:
+			return parsed
+
+	# Extract the outermost {...} block.
 	start = trimmed.find("{")
 	end = trimmed.rfind("}")
 	if start != -1 and end != -1 and end > start:
-		try:
-			parsed = json.loads(trimmed[start : end + 1])
-			if isinstance(parsed, dict):
-				return parsed
-		except json.JSONDecodeError:
-			return None
-	return None
+		parsed = _try(trimmed[start : end + 1])
+		if parsed is not None:
+			return parsed
+
+	# Final fallback: best-effort key extraction into a dict, even if JSON is invalid.
+	# This is intentionally conservative: it only extracts integer values for known keys.
+	keys = ("motor", "pump", "tank", "valve")
+	found_any = False
+	out: dict[str, Any] = {}
+	for key in keys:
+		m = re.search(r"\b" + re.escape(key) + r"\b\s*[:=\-]\s*(\d{1,5})", trimmed, flags=re.IGNORECASE)
+		if m:
+			out[key] = int(m.group(1))
+			found_any = True
+	if not found_any:
+		return None
+	if "industry" in trimmed.lower():
+		mi = re.search(r"industry\b\s*[:=\-]\s*\"?([^\n\r\"\}]+)\"?", trimmed, flags=re.IGNORECASE)
+		if mi:
+			out["industry"] = mi.group(1).strip()
+		else:
+			out["industry"] = "Unknown"
+	return out if out else None
+
 
 
 def _apply_ollama_adjustments(text_blob: str, components: list[dict[str, Any]], ocr_counts: dict[str, int], industry_hint: str) -> list[dict[str, Any]]:
@@ -1002,6 +2640,7 @@ def _apply_ollama_adjustments(text_blob: str, components: list[dict[str, Any]], 
         return components
     adjusted_counts = ollama_result.get("counts", {})
     # Adjust low‑confidence detections to match Ollama‑suggested counts
+    # Expert-level: Very aggressive - much lower confidence threshold for adjustments
     for cat, target in adjusted_counts.items():
         if cat not in COUNT_KEYS:
             continue
@@ -1011,7 +2650,7 @@ def _apply_ollama_adjustments(text_blob: str, components: list[dict[str, Any]], 
         for det in components:
             if deficit <= 0:
                 break
-            if det.get("confidence", 0) < 0.7 and det.get("category") != cat:
+            if det.get("confidence", 0) < 0.75 and det.get("category") != cat:
                 det["category"] = cat
                 det["name"] = cat.title()
                 det["confidence"] = max(det.get("confidence", 0), 0.75)
@@ -1070,21 +2709,27 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 
 	token_summary = json.dumps(text_counts)
 	prompt = (
-		"You are a strict P&ID counts verifier.\n"
-		"Given the OCR-derived counts, a short OCR text sample, and a token summary extracted from the text,\n"
-		"output ONLY a single JSON object matching schema: {\"motor\":int,\"pump\":int,\"tank\":int,\"valve\":int,\"industry\":str}.\n"
-		"Rules: counts must be non-negative integers. You may increase a count only if token evidence clearly supports it.\n"
-		f"Input counts: {json.dumps(counts)}\n"
-		f"Token summary: {token_summary}\n"
+		"You are an expert P&ID component counter.\n"
+		"Count ONLY physical equipment symbols drawn on this sheet: motors, pumps, tanks/vessels/drums, and valves "
+		"(bow-tie, gate, globe, ball, control, check, relief). Do NOT count instrument bubbles "
+		"(PT, FT, LT, TT, PC, LC), controllers, line labels alone, or off-page references "
+		"(e.g. 'From P-201' names a pump not shown here — count pump 0).\n"
+		"Output ONLY one JSON object: "
+		'{"motor":int,"pump":int,"tank":int,"valve":int,"industry":str}\n'
+		f"OpenCV/template detection counts (may be wrong): {json.dumps(counts)}\n"
+		f"OCR token counts from tags: {token_summary}\n"
 		f"Industry hint: {industry_hint}\n"
-		f"OCR text sample: {text_blob[:3000]}\n"
+		f"OCR text from diagram:\n{text_blob[:4000]}\n"
 	)
 
 	env_models = [m.strip() for m in OLLAMA_MODELS.split(",") if m.strip()]
-	# If env explicitly set to 'auto' or empty, try to discover models from Ollama server
+	# If env explicitly set to 'auto' or empty, discover from Ollama server
 	if len(env_models) == 1 and env_models[0].lower() in ("", "auto", "discover"):
 		discovered = get_available_ollama_models()
-		models = discovered if discovered else [OLLAMA_MODEL]
+		if not discovered:
+			logger.warning("Ollama: no models found on server, skipping verification.")
+			return None
+		models = discovered
 	else:
 		models = env_models if env_models else [OLLAMA_MODEL]
 	run_log: dict[str, Any] = {
@@ -1104,30 +2749,29 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 		n = (name or "").lower()
 		return any(tok in n for tok in ("70", "65", "-70b", "70b", "llama2-70", "llama-70", "opt-66b", "xxl"))
 
-	small_models = [m for m in models if not _is_large_model(m)]
+	small_models = _prefer_fast_ollama_models([m for m in models if not _is_large_model(m)])
 	large_models = [m for m in models if _is_large_model(m)]
 	if fast_mode:
 		small_models = small_models[:1]
 		large_models = []
+		logger.info("Ollama fast path using model: %s", small_models[0] if small_models else "none")
 
-	deterministic_final = {k: max(int(counts.get(k, 0)), int(text_counts.get(k, 0))) for k in COUNT_KEYS}
+	deterministic_final = {k: int(counts.get(k, 0)) for k in COUNT_KEYS}
 
 	# Helper to query a single model (used with ThreadPoolExecutor)
 	def _query_model(model_name: str) -> tuple[str, str, dict | None, str | None]:
 		last_error: str | None = None
-		max_attempts = 1 if fast_mode else 3
+		max_attempts = 2 if fast_mode else 3
 		for attempt in range(max_attempts):
 			payload = {
 				"model": model_name,
 				"prompt": prompt,
 				"stream": False,
 				"format": response_schema,
-				"options": {"temperature": 0, "num_predict": 256},
+				"options": {"temperature": 0, "num_predict": 128},
 			}
 			try:
 				timeout_sec = OLLAMA_FAST_TIMEOUT_SECONDS if fast_mode else OLLAMA_TIMEOUT_SECONDS
-				if not _is_large_model(model_name):
-					timeout_sec = min(timeout_sec, 12)
 				response = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=timeout_sec)
 				response.raise_for_status()
 				body = response.json()
@@ -1173,7 +2817,7 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 					val = int(parsed.get(key, aggregated_counts.get(key, 0)))
 				except (TypeError, ValueError):
 					val = int(aggregated_counts.get(key, 0))
-				aggregated_counts[key] = max(aggregated_counts.get(key, 0), val, int(text_counts.get(key, 0)))
+				aggregated_counts[key] = max(aggregated_counts.get(key, 0), val)
 			raw_ind = parsed.get("industry")
 			if isinstance(raw_ind, str) and raw_ind.strip() and raw_ind.lower() != "unknown":
 				chosen_industry = raw_ind.strip()
@@ -1196,7 +2840,7 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 						val = int(parsed.get(key, aggregated_counts.get(key, 0)))
 					except (TypeError, ValueError):
 						val = int(aggregated_counts.get(key, 0))
-					aggregated_counts[key] = max(aggregated_counts.get(key, 0), val, int(text_counts.get(key, 0)))
+					aggregated_counts[key] = max(aggregated_counts.get(key, 0), val)
 				raw_ind = parsed.get("industry")
 				if isinstance(raw_ind, str) and raw_ind.strip() and raw_ind.lower() != "unknown":
 					chosen_industry = raw_ind.strip()
@@ -1211,9 +2855,8 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 		pass
 
 	if not any_parsed:
-		logger.warning("Ollama did not return a valid JSON count result; continuing without verifier.")
-		# Fail-open: return None so callers can continue without Ollama adjustments.
-		return None
+		logger.debug("Ollama did not return a valid JSON count result; using deterministic counts.")
+		return {"counts": deterministic_final, "industry": chosen_industry, "models_used": models}
 
 	return {"counts": aggregated_counts, "industry": chosen_industry, "models_used": models}
 
@@ -1302,6 +2945,7 @@ def get_annotation_detections_for_image(image: Image.Image) -> list[dict[str, An
 				"category": label,
 				"bbox": (x, y, w, h),
 				"confidence": 0.95,
+					"source": "annotation",
 				"area": w * h,
 				"circularity": 0.0,
 				"aspect_ratio": float(w) / max(1.0, float(h)),
@@ -1313,175 +2957,534 @@ def get_annotation_detections_for_image(image: Image.Image) -> list[dict[str, An
 	return detections
 
 
-async def analyze_pid_image_async(image: Image.Image, fast_mode: bool = False) -> dict[str, Any]:
+def _apply_active_learning_labels(
+	components: list[dict[str, Any]],
+	image_array: np.ndarray,
+	ocr_detections: list[dict[str, Any]],
+	*,
+	user_library_mode: bool,
+) -> list[dict[str, Any]]:
+	"""Re-label shape candidates using the Random Forest trained on uploaded component photos."""
+	try:
+		if __package__:
+			from . import active_learning
+		else:
+			import active_learning
+	except Exception as exc:
+		logger.warning("Active learning unavailable: %s", exc)
+		return components
+
+	model_blob = active_learning.load_model_cached()
+	if model_blob is None:
+		return components
+
+	scored = active_learning.predict_candidates(image_array, components, model_blob=model_blob)
+	# Expert-level: Lowered thresholds for better classification accuracy
+	base_threshold = 0.40 if user_library_mode else 0.50
+	valve_cap = 0.55 if user_library_mode else 0.75
+
+	for candidate in scored:
+		predicted = candidate.get("predicted")
+		prob = float(candidate.get("prob", 0.0) or 0.0)
+		if not predicted:
+			continue
+
+		current_category = candidate.get("category")
+		downgrade_from_tank = current_category == "tank" and predicted != "tank"
+		# Expert-level: Lowered tank downgrade threshold for better accuracy
+		threshold = 0.70 if downgrade_from_tank else base_threshold
+		if predicted == "valve":
+			threshold = min(threshold, valve_cap)
+
+		nearby_blob = " ".join(
+			item.get("normalized_text", "")
+			for item in nearby_ocr_texts(candidate.get("bbox", (0, 0, 0, 0)), ocr_detections)
+		)
+		text_supports_valve = bool(
+			_VALVE_TAG_RE.search(nearby_blob)
+		)
+
+		if predicted and (
+			prob >= threshold
+			or (predicted == "valve" and text_supports_valve and prob >= 0.40)
+		):
+			candidate["category"] = predicted
+			candidate["confidence"] = max(float(candidate.get("confidence", 0.0) or 0.0), prob)
+			if str(candidate.get("name", "")).lower() in ("motor", "pump", "tank", "valve", "other"):
+				candidate["name"] = predicted.title()
+
+	return scored
+
+
+async def analyze_pid_image_async(
+	image: Image.Image,
+	fast_mode: bool = False,
+	use_component_library: bool = False,
+) -> dict[str, Any]:
 	image_array = np.array(image.convert("RGB"))
-	
+
+	# If the user library is enabled, templates may have just changed (new uploads).
+	# Clear the cache so results are deterministic per run.
+	if use_component_library:
+		clear_annotation_templates_cache()
+
 	# Run OCR and shape detection in parallel. If easyocr missing, skip OCR and continue.
 	if easyocr is None:
 		ocr_task = asyncio.create_task(asyncio.to_thread(lambda: []))
 	else:
 		ocr_task = asyncio.create_task(asyncio.to_thread(extract_ocr_detections, image_array, fast_mode))
-	shape_task = asyncio.create_task(asyncio.to_thread(detect_shape_components, image_array, []))
+
 	
 	try:
-		ocr_detections, shape_detections_raw = await asyncio.gather(ocr_task, shape_task)
+		ocr_detections = await ocr_task
 	except Exception:
-		for task in (ocr_task, shape_task):
-			if not task.done():
-				task.cancel()
-		await asyncio.gather(ocr_task, shape_task, return_exceptions=True)
+		if not ocr_task.done():
+			ocr_task.cancel()
+		await asyncio.gather(ocr_task, return_exceptions=True)
 		raise
 	
 	text_blob = " ".join(detection.get("text", "") for detection in ocr_detections).strip()
 	text_counts = extract_counts_from_text(text_blob)
-	text_detections = [
-		{
-			"name": detection["text"],
-			"category": "text",
-			"bbox": detection["bbox"],
-			"confidence": detection.get("confidence", 0.0),
-		}
-		for detection in ocr_detections
-	]
 	
-	# Re-run shape detection with OCR data for better classification
-	shape_component_detections = detect_shape_components(image_array, ocr_detections)
-	# Match annotation templates only in the full path; skip in fast mode
+	# Run shape detection with OCR context for better classification
+	shape_component_detections = await asyncio.to_thread(detect_shape_components, image_array, ocr_detections)
+	logger.info(f"Shape detection found {len(shape_component_detections)} components")
+	
+	# Template-match uploaded component reference photos (annotations folder).
+	# Always run template matching for expert-level accuracy using annotation images
 	template_detections: list[dict[str, Any]] = []
-	if not fast_mode:
-		templates = load_annotation_templates()
-		template_detections = match_annotation_templates(image_array, templates, threshold=0.72)
+	feature_detections: list[dict[str, Any]] = []
+	edge_detections: list[dict[str, Any]] = []
+	ssim_detections: list[dict[str, Any]] = []
+	template_count = 0
+	templates = load_annotation_templates()
+	templates_available = bool(templates)
+	if templates_available:
+		# Use full template set (all categories) with expert-level thresholds
+		try:
+			template_threshold = 0.45  # Lowered threshold for maximum template matching accuracy
+			template_count = sum(len(v) for v in templates.values())
+			
+			# Expert-level: Lower threshold specifically for tank templates to improve tank detection
+			tank_templates = {k: v for k, v in templates.items() if k == "tank"}
+			other_templates = {k: v for k, v in templates.items() if k != "tank"}
+			
+			# Run template matching, feature matching, and edge matching in parallel
+			template_task = asyncio.to_thread(
+				match_annotation_templates,
+				image_array,
+				other_templates,
+				template_threshold,
+				extended_scales=True,  # Always use extended scales for expert accuracy
+			)
+			
+			# Separate task for tank templates with lower threshold
+			tank_template_task = asyncio.to_thread(
+				match_annotation_templates,
+				image_array,
+				tank_templates,
+				0.40,  # Even lower threshold for tanks to improve recall
+				extended_scales=True,
+			)
+			
+			feature_task = asyncio.to_thread(
+				match_features_with_orb,
+				image_array,
+				templates,
+				min_matches=8,
+				extended_scales=True,
+			)
+			
+			edge_task = asyncio.to_thread(
+				match_edges_template,
+				image_array,
+				templates,
+				threshold=0.50,
+				extended_scales=True,
+			)
+			
+			# Expert-level: Add SSIM-based template matching for structural similarity
+			ssim_task = asyncio.to_thread(
+				match_with_ssim,
+				image_array,
+				templates,
+				threshold=0.55,
+				extended_scales=True,
+			)
+			
+			template_detections, tank_template_detections, feature_detections, edge_detections, ssim_detections = await asyncio.wait_for(
+				asyncio.gather(template_task, tank_template_task, feature_task, edge_task, ssim_task, return_exceptions=True),
+				timeout=TEMPLATE_MATCH_TIMEOUT_SECONDS,
+			)
+			
+			# Handle exceptions from individual tasks
+			if isinstance(template_detections, Exception):
+				logger.warning(f"Template matching failed: {template_detections}")
+				template_detections = []
+			if isinstance(tank_template_detections, Exception):
+				logger.warning(f"Tank template matching failed: {tank_template_detections}")
+				tank_template_detections = []
+			if isinstance(feature_detections, Exception):
+				logger.warning(f"Feature matching failed: {feature_detections}")
+				feature_detections = []
+			if isinstance(edge_detections, Exception):
+				logger.warning(f"Edge matching failed: {edge_detections}")
+				edge_detections = []
+			if isinstance(ssim_detections, Exception):
+				logger.warning(f"SSIM matching failed: {ssim_detections}")
+				ssim_detections = []
+			
+			# Combine regular and tank template detections
+			template_detections = template_detections + tank_template_detections
+			
+			logger.info(
+				"Template matching: %s hits (including %s tank hits), Feature matching: %s hits, Edge matching: %s hits, SSIM matching: %s hits from %s reference image(s)",
+				len(template_detections),
+				len(tank_template_detections),
+				len(feature_detections),
+				len(edge_detections),
+				len(ssim_detections),
+				template_count,
+			)
+		except asyncio.TimeoutError:
+			logger.warning(
+				"Template/feature/edge matching timed out after %.0fs (%s templates); using shape detection only",
+				TEMPLATE_MATCH_TIMEOUT_SECONDS,
+				template_count,
+			)
+			template_detections = []
+			feature_detections = []
+			edge_detections = []
+			ssim_detections = []
+	else:
+		logger.warning("No annotation templates available")
+		ssim_detections = []
+
+
 	ocr_component_detections, ocr_counts, industry = detect_text_driven_components(ocr_detections)
 
-	# Combine shape, text-driven, template matches, and any hand-drawn annotations
+	# Combine shape, text-driven, template matches, feature matches, edge matches, and any hand-drawn annotations
 	annotation_detections = get_annotation_detections_for_image(image)
-	combined_components = shape_component_detections + ocr_component_detections + template_detections + annotation_detections
-	deduped_components = dedupe_detections(combined_components)
-	merged_components = merge_close_detections(deduped_components)
 	
-	# Try to use vision model detection if available to supplement counts
-	vision_model_components: list[dict[str, Any]] = []
-	try:
-		if __package__:
-			from . import coordinate_detection
-		else:
-			import coordinate_detection
+	# Expert-level: Use ensemble voting to combine multiple detection methods
+	if templates_available and (template_detections or feature_detections or edge_detections or ssim_detections):
+		# Combine template, feature, edge, and SSIM detections using ensemble voting
+		image_based_detections = ensemble_vote_detections(
+			template_detections,
+			feature_detections,
+			shape_detections=[],  # Shape detections are handled separately
+			ssim_detections=ssim_detections,
+			edge_detections=edge_detections,
+			iou_threshold=0.30,
+		)
+		logger.info(f"Ensemble voting produced {len(image_based_detections)} image-based detections")
+	else:
+		# Fall back to simple concatenation if no templates available
+		image_based_detections = template_detections + feature_detections + edge_detections + (ssim_detections or [])
+	
+	combined_components = (
+		shape_component_detections
+		+ ocr_component_detections
+		+ image_based_detections
+		+ annotation_detections
+	)
+	
+	# Expert-level: Apply context-aware classification to improve accuracy
+	# This analyzes spatial relationships similar to how Claude AI understands diagram semantics
+	image_h, image_w = image_array.shape[:2]
+	combined_components = apply_context_aware_classification(combined_components, image_w, image_h)
+	
+	# Expert-level: Multi-stage verification pipeline
+	# Cross-validate detections using multiple criteria to reduce false positives
+	verified_components = []
+	for det in combined_components:
+		category = det.get("category")
+		confidence = float(det.get("confidence", 0.0))
+		bbox = det.get("bbox")
 		
-		# Try to get config for vision model
-		config = {
-			"api_key": os.getenv("OPENROUTER_API_KEY", ""),
-			"base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-			"qwen_model": os.getenv("QWEN_MODEL", "qwen/qwen-2-vl-7b-instruct"),
-			"site_url": os.getenv("SITE_URL", "http://localhost"),
-			"app_name": os.getenv("APP_NAME", "Sarla P&ID"),
-		}
+		# High confidence detections pass immediately
+		if confidence >= 0.75:
+			verified_components.append(det)
+			continue
 		
-		if config.get("api_key"):
-			try:
-				vision_result = await asyncio.to_thread(coordinate_detection.detect_coordinates, image, config)
-				if vision_result and "root" in vision_result and "children" in vision_result["root"]:
-					for child in vision_result["root"]["children"]:
-						if "meta" in child and "position" in child:
-							name = child["meta"].get("name", "Unknown")
-							position = child["position"]
-							component_type = child.get("type", "ia.symbol.other")
-							
-							# Map vision model type to our category
-							category = "other"
-							if "motor" in component_type or "mtr" in name.lower():
-								category = "motor"
-							elif "pump" in component_type or "pump" in name.lower():
-								category = "pump"
-							elif "tank" in component_type or "vessel" in component_type or "tank" in name.lower():
-								category = "tank"
-							elif "valve" in component_type or "valve" in name.lower():
-								category = "valve"
-							
-							vision_model_components.append({
-								"name": name,
-								"category": category,
-								"bbox": (position.get("x", 0), position.get("y", 0), position.get("width", 0), position.get("height", 0)),
-								"confidence": 0.9,  # High confidence for vision model
-								"area": position.get("width", 0) * position.get("height", 0),
-								"circularity": 0.0,
-								"aspect_ratio": float(position.get("width", 1)) / max(1.0, float(position.get("height", 1))),
-								"vertex_count": 0,
-								"extent": 0.0,
-								"solidity": 0.0,
-							})
-					logger.info(f"Vision model detected {len(vision_model_components)} components")
-			except Exception as e:
-				logger.warning(f"Vision model detection failed: {e}")
-	except Exception as e:
-		logger.warning(f"Could not import coordinate_detection: {e}")
-	
-	# Merge vision model components with local detection
-	if vision_model_components:
-		# Add vision model components to the combined list
-		combined_with_vision = merged_components + vision_model_components
-		# Dedupe to avoid counting the same component twice
-		merged_components = dedupe_detections(combined_with_vision)
-		merged_components = merge_close_detections(merged_components)
-	
-	# Apply Ollama verification & adjustment only if enabled
-	if OLLAMA_USE_FOR_COUNTS and OLLAMA_ENABLED:
-		merged_components = _apply_ollama_adjustments(text_blob, merged_components, ocr_counts, None)
-
-	# Apply Active Learning model if available to override heuristics
-	if not fast_mode:
-		try:
-			if __package__:
-				from . import active_learning
+		# Medium confidence detections need additional verification
+		if confidence >= 0.50 and bbox:
+			area = float(det.get("area", 0))
+			aspect_ratio = float(det.get("aspect_ratio", 1.0))
+			
+			# Verify geometry matches category expectations
+			if category == "tank":
+				# Tanks should have reasonable area and aspect ratio
+				if area >= 200 and (aspect_ratio >= 1.2 or aspect_ratio <= 0.85):
+					verified_components.append(det)
+			elif category == "valve":
+				# Valves should be compact
+				if area >= 50 and area <= 2000:
+					verified_components.append(det)
+			elif category in ["motor", "pump"]:
+				# Motors and pumps should have reasonable size
+				if area >= 100 and area <= 3000:
+					verified_components.append(det)
 			else:
-				import active_learning
-			scored_components = active_learning.predict_candidates(image_array, merged_components)
-			for candidate in scored_components:
-				predicted = candidate.get("predicted")
-				prob = float(candidate.get("prob", 0.0))
-				if predicted and prob >= 0.75:
-					candidate["category"] = predicted
-					if candidate.get("name", "").lower() in ("motor", "pump", "tank", "valve", "other"):
-						candidate["name"] = predicted.title()
-				merged_components = scored_components
-		except Exception as e:
-			logger.warning(f"Failed to apply active learning to candidates: {e}")
+				# Unknown category, keep if reasonable confidence
+				if confidence >= 0.55:
+					verified_components.append(det)
+		# Low confidence detections are filtered out unless they have strong OCR support
+		elif confidence >= 0.40 and det.get("name", "").lower() in ["tank", "motor", "pump", "valve"]:
+			verified_components.append(det)
+	
+	combined_components = verified_components
 
-	# Keep shape detections explicitly if needed by calling code, but visual_detections incorporates both
-	shape_detections = dedupe_detections(shape_component_detections)
+	# Sort combined components by bbox for deterministic processing
+	combined_components = sorted(combined_components, key=lambda x: (x["bbox"][1], x["bbox"][0], x["category"]))
+	
+	# Dedupe with a higher IoU threshold to avoid merging distinct nearby components
+	deduped_components = dedupe_detections(combined_components, iou_threshold=0.45)
+
+	# Only merge components that are very close (0.4× box size) — prevents collapsing distinct components
+	merged_components = merge_close_detections(deduped_components, distance_ratio=0.4)
+	merged_components = merge_stacked_tank_symbols(merged_components)
+	image_area = float(image_array.shape[0] * image_array.shape[1])
+	merged_components = consolidate_tank_vessels(merged_components, image_area=image_area)
+
+	# --- Check-valve refinement stage (reference-image assisted) ---
+	# Promote small/compact valve-like candidates to `valve` when they are strongly supported
+	# by valve reference templates. This reduces missed check valves without introducing large false positives.
+	debug_refinement: dict[str, Any] = {
+		"valve_template_hits": 0,
+		"promoted_valves": 0,
+	}
+
+	# Count template evidence (valve templates from unified template matching)
+	valve_templates = [d for d in template_detections if d.get("category") == "valve"]
+	if valve_templates:
+		debug_refinement["valve_template_hits"] = len(valve_templates)
+
+	def _near_template_evidence(
+		candidate_box: tuple[int, int, int, int],
+		evidence_box: tuple[int, int, int, int],
+		image_area: float,
+		) -> bool:
+		cx1, cy1 = bbox_center(candidate_box)
+		cx2, cy2 = bbox_center(evidence_box)
+		# Use larger dimension as symbol “scale” proxy.
+		w1, h1 = candidate_box[2], candidate_box[3]
+		w2, h2 = evidence_box[2], evidence_box[3]
+		max_dim = max(float(w1), float(h1), float(w2), float(h2), 1.0)
+		# Distance threshold: allow small/compact symbols to be validated even
+		# when their contour boxes don’t overlap much.
+		dist = math.hypot(cx1 - cx2, cy1 - cy2)
+		# Also gate by compactness relative to the whole page.
+		cand_area = float(max(0, candidate_box[2]) * max(0, candidate_box[3]))
+		if image_area > 0 and cand_area > image_area * 0.0030:
+			return False
+		return dist <= max_dim * 1.25
+
+	# Promote candidates near template evidence (distance/size based).
+	if valve_templates:
+		template_boxes = [d.get("bbox") for d in valve_templates if d.get("bbox")]
+		if template_boxes:
+			for det in merged_components:
+				# Never treat tanks as valves.
+				if det.get("category") == "tank":
+					continue
+				if not _candidate_is_compact_valve_like(det):
+					continue
+				box = det.get("bbox")
+				if not box:
+					continue
+
+				# Extra cue: if nearby OCR already contains a valve tag, allow
+				# promotion even if template overlap is low.
+				nearby_text = ""
+				try:
+					# Slightly expanded box for cue extraction.
+					nearby = nearby_ocr_texts(box, ocr_detections, padding_ratio=0.45)
+					nearby_text = " ".join(item.get("text", "") for item in nearby).strip()
+				except Exception:
+					nearby_text = ""
+
+				nearby_has_valve_tag = bool(_VALVE_TAG_RE.search(nearby_text or ""))
+				# Geometry evidence (from our classifier).
+				candidate_valve_conf = float(det.get("confidence", 0.0) or 0.0)
+
+				# Check if near any template hit evidence.
+				for tb in template_boxes:
+					if not tb:
+						continue
+					if _near_template_evidence(box, tb, image_area=image_area):
+						# Gate promotion: must have valve OCR tag nearby OR a tighter template proximity.
+						# Avoid permissive geometry-only promotion to prevent inflation.
+						if nearby_has_valve_tag:
+							det["category"] = "valve"
+							det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.82)
+							debug_refinement["promoted_valves"] += 1
+							break
+						else:
+							# Tight proximity requirement when there's no explicit valve tag.
+							# Use smaller threshold than _near_template_evidence to reduce false positives.
+							narrow_ok = _near_template_evidence(box, tb, image_area=image_area) and (
+								iou(box, tb) >= 0.06 or (
+									(math.hypot(*tuple(a-b for a,b in zip(bbox_center(box), bbox_center(tb)))) <= max(box[2], box[3], tb[2], tb[3]) * 0.75)
+								)
+							)
+							if narrow_ok:
+								det["category"] = "valve"
+								det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.82)
+								debug_refinement["promoted_valves"] += 1
+								break
+
+
+	def _candidate_is_compact_valve_like(det: dict[str, Any]) -> bool:
+		if det.get("category") == "valve":
+			return True
+		if det.get("category") == "tank":
+			return False
+		box = det.get("bbox")
+		if not box:
+			return False
+		x, y, w, h = box
+		area = float(det.get("area", w * h))
+		aspect_ratio = float(det.get("aspect_ratio", w / max(h, 1)))
+		extent = float(det.get("extent", 0.0) or 0.0)
+		solidity = float(det.get("solidity", 0.0) or 0.0)
+		vertex_count = int(det.get("vertex_count", 0) or 0)
+
+		tank_like = _is_tank_like_geometry(area, aspect_ratio, extent, solidity, image_area)
+		valve_like = _is_compact_bowtie_valve(
+			area,
+			aspect_ratio,
+			float(det.get("circularity", 0.0) or 0.0),
+			vertex_count,
+			extent,
+			solidity,
+			image_area,
+			tank_like=tank_like,
+			bbox=box,
+		)
+		if not valve_like:
+			return False
+
+		# Compactness: box area should be in a small band relative to image size.
+		if image_area > 0 and area > image_area * 0.0025:
+			return False
+
+		# Require some symbol structure signals (extent/solidity)
+		if extent < 0.12 or solidity < 0.20:
+			return False
+		return True
+
+
+	# Re-run dedupe + valve suppression after refinement to avoid duplicates
+	deduped_components = dedupe_detections(merged_components, iou_threshold=0.45)
+	merged_components = merge_close_detections(deduped_components, distance_ratio=0.4)
+	merged_components = merge_stacked_tank_symbols(merged_components)
+	merged_components = consolidate_tank_vessels(merged_components, image_area=image_area)
+
+	# Valve-specific suppression: removes nearby duplicate valve-like candidates
+	# (common failure mode is counting an extra check/control valve shape twice).
+	merged_components = suppress_nearby_valves(
+		merged_components,
+		iou_threshold=0.35,
+		center_dist_ratio=0.80,
+		area_ratio_min=0.50,
+		area_ratio_max=2.00,
+	)
+
+	merged_components = filter_valve_geometry_false_positives(
+		merged_components,
+		ocr_detections,
+		image_height=int(image_array.shape[0]),
+	)
+
+	# Final count-oriented collapse for nearby same-category duplicates.
+	merged_components = collapse_countable_clusters(merged_components)
+	merged_components = [
+		det
+		for det in merged_components
+		if _is_supported_template_detection(det, merged_components)
+	]
+
+	
+	# Vision model detection disabled to prevent discrepancy
+	# Using only shape detection and OCR for consistency
+	vision_model_components: list[dict[str, Any]] = []
+
+	
+	# Apply model trained on user-uploaded component photos.
+	if use_component_library or not fast_mode:
+		merged_components = _apply_active_learning_labels(
+			merged_components,
+			image_array,
+			ocr_detections,
+			user_library_mode=use_component_library,
+		)
+
+	# Keep shape detections explicitly if needed by calling code
 	visual_detections = merged_components
 
-	visual_counts = empty_counts()
-	for detection in visual_detections:
-		category = detection["category"]
-		# Text detections might not have visual confidence, so assume strong confidence if they were identified
-		conf = float(detection.get("confidence", 1.0))
-		# Only count visual detections that meet per-category confidence thresholds
-		if category in visual_counts and conf >= CONF_THRESH.get(category, 0.0):
-			visual_counts[category] += 1
+	# Fixed confidence thresholds — no adaptive raising based on detection count,
+	# which was incorrectly dropping valid detections when a category had >3 hits
+	active_thresh = CONF_THRESH.copy()
 
-	combined_counts = merge_counts_with_text_anchors(ocr_counts, visual_counts, text_counts)
-	
-	# Filter detections for coordinates to match component counts exactly
-	# Only include detections that meet the same confidence thresholds used for counting
-	filtered_for_coordinates = []
-	for detection in text_detections + merged_components:
-		category = detection.get("category")
-		conf = float(detection.get("confidence", 1.0))
-		# Only include if it's one of the 4 main types and meets confidence threshold
-		if category in COUNT_KEYS and conf >= CONF_THRESH.get(category, 0.0):
-			filtered_for_coordinates.append(detection)
-	
+	# Post-process: suppress candidates the active-learning model is uncertain about.
+	# If a candidate does not strongly match the reference images, reduce its confidence.
+	for _det in visual_detections:
+		try:
+			prob = float(_det.get("prob", 1.0))
+		except Exception:
+			prob = 1.0
+			
+		if "prob" in _det:
+			# Suppress highly uncertain predictions from the Random Forest.
+			# 0.50 is a strong threshold for a 4-class RF model.
+			if prob < 0.50:
+				_det["confidence"] = min(float(_det.get("confidence", 1.0)), 0.4)
+
+
+	# Single source of truth: build the exact set of components that will be used for:
+	# 1) counting
+	# 2) coordinates
+	# This removes the mismatch where coordinates used a slightly different filtered set.
+	countable_components: list[dict[str, Any]] = [
+		det
+		for det in visual_detections
+		if det.get("category") in COUNT_KEYS
+		and float(det.get("confidence", 1.0)) >= active_thresh.get(det.get("category"), 0.0)
+		and det.get("source") != "template"
+	]
+
+	# Deterministic counting from countable_components (no re-filter later)
+	visual_counts = empty_counts()
+	for detection in countable_components:
+		category = detection["category"]
+		visual_counts[category] += 1
+
+
+	library_refined = use_component_library
+	if library_refined:
+		# When the user supplied reference photos, trust shape + template + model counts.
+		combined_counts = dict(visual_counts)
+	else:
+		combined_counts = merge_counts_with_text_anchors(ocr_counts, visual_counts, text_counts)
+
+	# Use the same countable component set for coordinates as used for counting.
+	filtered_for_coordinates = countable_components
+
 	coordinates_task = asyncio.create_task(
 		asyncio.to_thread(
 			detections_to_coordinates_payload,
-			dedupe_detections(filtered_for_coordinates),
-		)
+				dedupe_detections(filtered_for_coordinates, iou_threshold=0.8),
+			),
 	)
+
+
 	phi3_counts: dict[str, int] | None = None
 	phi3_industry: str | None = None
 	used_ollama = False
 	ollama_task: asyncio.Task[dict[str, Any] | None] | None = None
-	if OLLAMA_ENABLED and (fast_mode or OLLAMA_USE_FOR_COUNTS):
+	_disable_ollama = os.getenv("DISABLE_OLLAMA_VERIFICATION", "false").strip().lower() in {"1", "true", "yes", "on"}
+	if OLLAMA_ENABLED and OLLAMA_USE_FOR_COUNTS and not _disable_ollama:
 		ollama_task = asyncio.create_task(
 			asyncio.to_thread(
 				verify_with_ollama,
@@ -1491,43 +3494,89 @@ async def analyze_pid_image_async(image: Image.Image, fast_mode: bool = False) -
 				fast_mode=fast_mode,
 			),
 		)
+		logger.info("Ollama verification started (fast_mode=%s)", fast_mode)
+
+	async def _await_ollama_with_extension() -> dict[str, Any] | None:
+		"""Wait for Ollama; on first timeout, keep waiting up to completion budget."""
+		if ollama_task is None:
+			return None
+		try:
+			return await asyncio.wait_for(asyncio.shield(ollama_task), timeout=OLLAMA_COMPLETION_TIMEOUT_SECONDS)
+		except asyncio.TimeoutError:
+			if ollama_task.done():
+				try:
+					return ollama_task.result()
+				except asyncio.CancelledError:
+					logger.warning("Ollama task was cancelled after timeout; using OpenCV counts")
+					return None
+			logger.warning(
+				"Ollama still running after %ss — waiting up to %ss more for completion",
+				OLLAMA_COMPLETION_TIMEOUT_SECONDS,
+				OLLAMA_FAST_TIMEOUT_SECONDS,
+			)
+			try:
+				return await asyncio.wait_for(asyncio.shield(ollama_task), timeout=float(OLLAMA_FAST_TIMEOUT_SECONDS))
+			except asyncio.TimeoutError:
+				logger.error(
+					"Ollama did not finish within %ss total; using OpenCV counts",
+					OLLAMA_COMPLETION_TIMEOUT_SECONDS + OLLAMA_FAST_TIMEOUT_SECONDS,
+				)
+				return None
+		except asyncio.CancelledError:
+			logger.warning("Ollama wait was cancelled; using OpenCV counts")
+			return None
+
+	def _apply_ollama_counts(phi3_result: dict[str, Any] | None) -> None:
+		nonlocal industry, used_ollama, phi3_counts, phi3_industry
+		if not phi3_result:
+			return
+		phi3_counts = phi3_result["counts"]
+		phi3_industry = phi3_result.get("industry")
+		if phi3_industry:
+			industry = phi3_industry
+		used_ollama = True
+		if OLLAMA_TRUST_COUNTS:
+			for key in COUNT_KEYS:
+				combined_counts[key] = int(phi3_counts.get(key, 0) or 0)
+			return
+		for key in COUNT_KEYS:
+			ollama_val = int(phi3_counts.get(key, 0) or 0)
+			current = int(combined_counts.get(key, 0))
+			visual_val = int(visual_counts.get(key, 0))
+			# Trust Ollama to correct over-counts; allow modest under-count fixes when vision found nothing.
+			if ollama_val < current:
+				combined_counts[key] = ollama_val
+			elif visual_val == 0 and ollama_val > current:
+				combined_counts[key] = ollama_val
 
 	if fast_mode:
-		coordinates = await coordinates_task
 		if ollama_task is not None:
 			try:
-				phi3_result = await asyncio.wait_for(ollama_task, timeout=OLLAMA_FAST_TIMEOUT_SECONDS)
-				if phi3_result:
-					phi3_counts = phi3_result["counts"]
-					phi3_industry = phi3_result["industry"]
-					if phi3_industry:
-						industry = phi3_industry
-					used_ollama = True
-					for key in COUNT_KEYS:
-						combined_counts[key] = max(combined_counts.get(key, 0), phi3_counts.get(key, 0))
-			except asyncio.TimeoutError:
-				if not ollama_task.done():
-					ollama_task.cancel()
-				await asyncio.gather(ollama_task, return_exceptions=True)
-			except Exception:
-				if not ollama_task.done():
-					ollama_task.cancel()
-				await asyncio.gather(ollama_task, return_exceptions=True)
+				coordinates, phi3_result = await asyncio.gather(
+					coordinates_task,
+					_await_ollama_with_extension(),
+				)
+				_apply_ollama_counts(phi3_result)
+				if used_ollama:
+					logger.info("Ollama verification applied: %s", combined_counts)
+			except Exception as exc:
+				logger.warning("Ollama verification failed: %s", exc)
+				coordinates = await coordinates_task
+		else:
+			coordinates = await coordinates_task
 	elif ollama_task is None:
 		coordinates = await coordinates_task
 	else:
 		try:
-			phi3_result, coordinates = await asyncio.gather(ollama_task, coordinates_task)
-			if phi3_result:
-				phi3_counts = phi3_result["counts"]
-				phi3_industry = phi3_result["industry"]
-				if phi3_industry:
-					industry = phi3_industry
-				used_ollama = True
-				# Keep stable behavior by preventing regressions from verifier undercounting.
-				for key in COUNT_KEYS:
-					combined_counts[key] = max(combined_counts.get(key, 0), phi3_counts.get(key, 0))
+			phi3_result, coordinates = await asyncio.gather(
+				_await_ollama_with_extension(),
+				coordinates_task,
+			)
+			_apply_ollama_counts(phi3_result)
+			if used_ollama:
+				logger.info("Ollama verification applied: %s", combined_counts)
 		except Exception:
+
 			if not coordinates_task.done():
 				coordinates_task.cancel()
 			if ollama_task is not None and not ollama_task.done():
@@ -1550,8 +3599,12 @@ async def analyze_pid_image_async(image: Image.Image, fast_mode: bool = False) -
 		"used_ollama": used_ollama,
 		"coordinates": coordinates,
 		"ocr_detections": ocr_detections,
-		"detections": visual_detections,
+		"detections": countable_components,
+		"library_refined": library_refined,
+		"debug_refinement": debug_refinement,
 	}
+
+
 
 
 def analyze_pid_image(image: Image.Image, fast_mode: bool = False) -> dict[str, Any]:

@@ -187,8 +187,119 @@ def _load_annotation_lines() -> List[Dict[str, Any]]:
     return out
 
 
+def compute_feature_similarity(features1: Dict[str, Any], features2: Dict[str, Any]) -> float:
+    """Compute similarity score between two feature dictionaries using cosine similarity."""
+    # Get common feature keys
+    common_keys = set(features1.keys()) & set(features2.keys())
+    if not common_keys:
+        return 0.0
+    
+    # Extract feature vectors
+    vec1 = np.array([features1[k] for k in common_keys])
+    vec2 = np.array([features2[k] for k in common_keys])
+    
+    # Normalize vectors
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    
+    # Compute cosine similarity
+    similarity = float(np.dot(vec1, vec2) / (norm1 * norm2))
+    return max(0.0, similarity)  # Ensure non-negative
+
+
+def match_component_to_library(
+    component_features: Dict[str, Any],
+    component_category: str | None = None,
+    top_k: int = 5
+) -> List[Dict[str, Any]]:
+    """Match a component against the component library based on visual features."""
+    anns = _load_annotation_lines()
+    matches = []
+    
+    for entry in anns:
+        image_name = entry.get("image")
+        image_path = ANNOTATIONS_DIR / image_name
+        if not image_path.exists():
+            continue
+        
+        img = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+        
+        for ann in entry.get("annotations", []):
+            label = _normalize_label(ann.get("label", ""))
+            if not label:
+                continue
+            
+            # If category is specified, only match same category
+            if component_category and label != component_category:
+                continue
+            
+            bbox = ann.get("bbox", [0, 0, img.shape[1], img.shape[0]])
+            if len(bbox) == 4:
+                x, y, w, h = bbox
+                lib_features = _extract_fast_features(img, (x, y, w, h))
+                similarity = compute_feature_similarity(component_features, lib_features)
+                
+                matches.append({
+                    "image": image_name,
+                    "label": label,
+                    "bbox": bbox,
+                    "similarity": similarity,
+                })
+    
+    # Sort by similarity and return top matches
+    matches.sort(key=lambda x: x["similarity"], reverse=True)
+    return matches[:top_k]
+
+
+def _extract_fast_features(image_array: np.ndarray, bbox: Tuple[int, int, int, int]) -> Dict[str, Any]:
+    """Lightweight feature extraction for training — no HOG, no bilateral filter."""
+    x, y, w, h = bbox
+    h_img, w_img = image_array.shape[:2]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(w_img, x + w), min(h_img, y + h)
+    roi = image_array[y1:y2, x1:x2]
+    if roi.size == 0:
+        roi = image_array
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
+    edges = cv2.Canny(resized, 50, 150)
+    aspect = float(w / max(h, 1))
+    mean_int = float(np.mean(resized))
+    std_int = float(np.std(resized))
+    edge_density = float(np.count_nonzero(edges) / max(1, edges.size))
+    thresh = cv2.adaptiveThreshold(resized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    foreground_ratio = float(np.count_nonzero(thresh) / max(1, thresh.size))
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    largest = max(contours, key=cv2.contourArea) if contours else None
+    feats: Dict[str, Any] = {
+        "area": float(max(1, w * h)),
+        "aspect": aspect,
+        "mean_intensity": mean_int,
+        "std_intensity": std_int,
+        "edge_density": edge_density,
+        "foreground_ratio": foreground_ratio,
+    }
+    if largest is not None:
+        ca = float(cv2.contourArea(largest))
+        perim = float(cv2.arcLength(largest, True))
+        hull = cv2.convexHull(largest)
+        hull_area = float(cv2.contourArea(hull)) if len(hull) >= 3 else 0.0
+        feats["circularity"] = float((4.0 * math.pi * ca) / max(1.0, perim * perim))
+        feats["solidity"] = float(ca / hull_area) if hull_area > 0 else 0.0
+        feats["extent"] = float(ca / max(1.0, float(w * h)))
+    else:
+        feats["circularity"] = 0.0
+        feats["solidity"] = 0.0
+        feats["extent"] = 0.0
+    return feats
+
+
 def build_training_dataset() -> Tuple[pd.DataFrame, pd.Series]:
     rows = []
+    seen: set[str] = set()
     anns = _load_annotation_lines()
     for entry in anns:
         image_name = entry.get("image")
@@ -201,8 +312,12 @@ def build_training_dataset() -> Tuple[pd.DataFrame, pd.Series]:
             bbox = ann.get("bbox")
             if not bbox or len(bbox) != 4:
                 continue
-            # approximate vertex_count as 0 (could be improved)
-            feats = _extract_features_from_box(img, tuple(bbox), vertex_count=0)
+            # Deduplicate: same image + same bbox + same label seen before → skip
+            dedup_key = f"{image_name}|{bbox}|{label}"
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            feats = _extract_fast_features(img, tuple(bbox))
             feats["label"] = label
             rows.append(feats)
 
@@ -218,24 +333,29 @@ def train_model() -> Dict[str, Any]:
     df, y = build_training_dataset()
     if df.empty:
         return {"status": "no_data"}
+    if len(df) < 4:
+        logger.warning(
+            "Only %s training sample(s) — upload more component photos (2+ per type) for reliable P&ID counts.",
+            len(df),
+        )
     # encode labels
     labels = sorted(y.unique())
     label_to_int = {lab: i for i, lab in enumerate(labels)}
     y_int = y.map(label_to_int)
 
     clf = RandomForestClassifier(
-        n_estimators=600, 
-        random_state=42, 
+        n_estimators=30,
+        random_state=42,
         class_weight="balanced",
-        max_depth=15,
+        max_depth=8,
         min_samples_leaf=1,
         min_samples_split=2,
         max_features="sqrt",
         bootstrap=True,
-        n_jobs=-1  # Use all cores for faster training
+        n_jobs=-1,
     )
     clf.fit(df.values, y_int.values)
-    joblib.dump({"model": clf, "labels": labels, "columns": df.columns.tolist(), "feature_version": 2}, MODEL_PATH)
+    joblib.dump({"model": clf, "labels": labels, "columns": df.columns.tolist(), "feature_version": FEATURE_VERSION}, MODEL_PATH)
     invalidate_model_cache()
     return {"status": "trained", "rows": len(df), "labels": labels}
 
@@ -246,6 +366,9 @@ def load_model():
     return joblib.load(MODEL_PATH)
 
 
+FEATURE_VERSION = 3  # increment when fast-feature schema changes
+
+
 def load_model_cached():
     global _MODEL_CACHE, _MODEL_CACHE_MTIME_NS
     if not MODEL_PATH.exists():
@@ -254,8 +377,20 @@ def load_model_cached():
     current_mtime = MODEL_PATH.stat().st_mtime_ns
     if _MODEL_CACHE is not None and _MODEL_CACHE_MTIME_NS == current_mtime:
         return _MODEL_CACHE
-    _MODEL_CACHE = load_model()
-    _MODEL_CACHE_MTIME_NS = current_mtime if _MODEL_CACHE is not None else None
+    blob = load_model()
+    # Reject stale models trained with a different feature schema
+    if blob is not None and blob.get("feature_version") != FEATURE_VERSION:
+        logger.warning("Stale model (wrong feature_version), deleting and retraining.")
+        MODEL_PATH.unlink(missing_ok=True)
+        invalidate_model_cache()
+        try:
+            train_model()
+            blob = load_model()
+        except Exception as exc:
+            logger.warning(f"Auto-retrain after stale model failed: {exc}")
+            return None
+    _MODEL_CACHE = blob
+    _MODEL_CACHE_MTIME_NS = current_mtime if blob is not None else None
     return _MODEL_CACHE
 
 
@@ -287,8 +422,7 @@ def predict_candidates(
     feats_list = []
     for c in candidates:
         bbox = tuple(c.get("bbox", (0, 0, 0, 0)))
-        vc = c.get("vertex_count", 0)
-        feats = _extract_features_from_box(image_array, bbox, vertex_count=vc)
+        feats = _extract_fast_features(image_array, bbox)
         feats_list.append([feats.get(col, 0) for col in cols])
 
     probs = clf.predict_proba(feats_list)
@@ -297,11 +431,6 @@ def predict_candidates(
         maxp = float(max(p))
         label_idx = int(p.argmax())
         predicted = labels[label_idx]
-        fallback_category = str(c.get("category", "")).strip().lower()
-        fallback_conf = float(c.get("confidence", 0.0) or 0.0)
-        if fallback_category == "valve" and predicted != "valve" and fallback_conf >= 0.45:
-            predicted = "valve"
-            maxp = max(maxp, fallback_conf)
         uncertainty = 1.0 - maxp
         results.append({**c, "predicted": predicted, "uncertainty": uncertainty, "prob": maxp})
     return results
