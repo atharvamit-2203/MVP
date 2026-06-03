@@ -40,13 +40,14 @@ else:
 	EASYOCR_IMPORT_ERROR = None
 
 
-COUNT_KEYS = ("motor", "pump", "tank", "valve")
+COUNT_KEYS = ("motor", "pump", "tank", "valve", "instrument")
 CATEGORY_TO_TYPE = {
 	"text": "ia.symbol.text",
 	"motor": "ia.symbol.motor",
 	"pump": "ia.symbol.pump",
 	"tank": "ia.symbol.tank",
 	"valve": "ia.symbol.valve",
+	"instrument": "ia.symbol.sensor",
 	"other": "ia.symbol.other",
 }
 
@@ -105,7 +106,7 @@ _OFF_PAGE_TAG_IN_TEXT_RE = re.compile(
 	r"\b(?:from|to)\s+[a-z]{0,4}[\s-]*\d{2,5}[a-z]?\b",
 	re.IGNORECASE,
 )
-_PUMP_TAG_RE = re.compile(r"\b(?:p|pu|pmp)-?\d{2,5}[a-z]?\b", re.IGNORECASE)
+_PUMP_TAG_RE = re.compile(r"\b(?:p|pu|pmp)-?\d{1,5}[a-z]?\b", re.IGNORECASE)
 
 _COUNTABLE_TEXT_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
 	"motor": (
@@ -114,18 +115,25 @@ _COUNTABLE_TEXT_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
 		re.compile(r"\bmtr-?\d{1,5}[a-z]?\b", re.IGNORECASE),
 	),
 	"pump": (
-		re.compile(r"\bp-?\d{2,5}[a-z]?\b", re.IGNORECASE),
-		re.compile(r"\bpu-?\d{2,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\bp-?\d{1,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\bpu-?\d{1,5}[a-z]?\b", re.IGNORECASE),
 		re.compile(r"\bpmp-?\d{1,5}[a-z]?\b", re.IGNORECASE),
 	),
 	"tank": (
-		re.compile(r"\bt-?\d{2,5}[a-z]?\b", re.IGNORECASE),
-		re.compile(r"\btk-?\d{2,5}[a-z]?\b", re.IGNORECASE),
-		re.compile(r"\bv-?\d{2,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\bt-?\d{1,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\btk-?\d{1,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\bv-?\d{1,5}[a-z]?\b", re.IGNORECASE),
 	),
 	"valve": (
 		re.compile(r"(?<![a-z0-9])(?:fv|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv|pcv|fcv|lcv|tcv|psv|nrv|sdv|mov|sov)-?\d[\d\-]*[a-z]?(?![a-z0-9])", re.IGNORECASE),
 		re.compile(r"(?<![a-z0-9])(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-?\d{1,5}[a-z]?(?![a-z0-9])", re.IGNORECASE),
+	),
+	"instrument": (
+		re.compile(r"\b(?:tic|tt|te|ti|tit)\-?\d{1,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\b(?:fic|ft|fe|fi|fit)\-?\d{1,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\b(?:lic|lt|le|li|lit)\-?\d{1,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\b(?:pic|pt|pe|pi|pit)\-?\d{1,5}[a-z]?\b", re.IGNORECASE),
+		re.compile(r"\b(?:aic|at|ae|ai)\-?\d{1,5}[a-z]?\b", re.IGNORECASE),
 	),
 }
 
@@ -157,8 +165,10 @@ def _countable_text_category(text: str) -> str | None:
 	alone does not inflate counts when the diagram repeats labels.
 	"""
 	normalized = normalize_text(text)
-	if not normalized or is_instrument_tag(normalized) or is_off_page_equipment_reference(normalized):
+	if not normalized or is_off_page_equipment_reference(normalized):
 		return None
+	if is_instrument_tag(normalized):
+		return "instrument"
 	for category, patterns in _COUNTABLE_TEXT_PATTERNS.items():
 		if any(pattern.search(normalized) for pattern in patterns):
 			return category
@@ -170,17 +180,19 @@ CATEGORY_REGEX_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 		"valve",
 		(
 			r"\b(?:check\s*valve|gate\s*valve|globe\s*valve|ball\s*valve|butterfly\s*valve|plug\s*valve)\b",
-			r"\b(?:pcv|fcv|lcv|tcv|psv|nrv|sdv|xv|hv|lv|fv|sv|cv|tv|pv|mov|sov|bv|gv|wv)\b",
-			r"\b(?:fv|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-[\d\-]+[a-z]?\b",
-			r"\b(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-?\d{1,5}[a-z]?\b",
-			r"\b(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)\d{1,5}[a-z]?\b",
+			r"(?<![a-z0-9])(?:pcv|fcv|lcv|tcv|psv|nrv|sdv|xv|hv|lv|fv|sv|cv|tv|pv|mov|sov|bv|gv|wv)-?\d[\d\-]*[a-z]?(?![a-z0-9])",
+			r"(?<![a-z0-9])(?:fv|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-[\d\-]+[a-z]?(?![a-z0-9])",
+			r"(?<![a-z0-9])(?:v|xv|cv|hv|lv|sv|pv|tv|gv|bv|wv)-?\d{1,5}[a-z]?(?![a-z0-9])",
 			r"\bvalve\b",
+			# More permissive patterns for simple valve tags like V1, V-1, V123
+			r"\bv-?\d{1,5}[a-z]?\b",
+			r"\bv\d{1,5}[a-z]?\b",
 		),
 	),
-	("pump", (r"\bp-?\d{2,5}[a-z]?\b", r"\bpu-?\d{2,5}[a-z]?\b", r"\bpmp-?\d{1,5}[a-z]?\b", r"\bpump\b")),
+	("pump", (r"\bp-?\d{1,5}[a-z]?\b", r"\bpu-?\d{1,5}[a-z]?\b", r"\bpmp-?\d{1,5}[a-z]?\b", r"\bpump\b")),
 	("motor", (r"\bm-?\d{2,5}[a-z]?\b", r"\bmo-?\d{2,5}[a-z]?\b", r"\bmtr-?\d{1,5}[a-z]?\b", r"\bmotor\b")),
 	("tank", (
-		r"\b(?:tk|t|v)-?\d{2,5}[a-z]?\b",
+		r"\b(?:tk|t|v)-?\d{1,5}[a-z]?\b",
 		r"\btk-?\d{1,5}[a-z]?\b",
 		r"\btank\b",
 		r"\bvessel\b",
@@ -192,6 +204,13 @@ CATEGORY_REGEX_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 		r"\baccumulator\b",
 		r"\breceiver\b",
 	)),
+	("instrument", (
+		r"\b(?:tic|tt|te|ti|tit)\-?\d{1,5}[a-z]?\b",
+		r"\b(?:fic|ft|fe|fi|fit)\-?\d{1,5}[a-z]?\b",
+		r"\b(?:lic|lt|le|li|lit)\-?\d{1,5}[a-z]?\b",
+		r"\b(?:pic|pt|pe|pi|pit)\-?\d{1,5}[a-z]?\b",
+		r"\b(?:aic|at|ae|ai)\-?\d{1,5}[a-z]?\b",
+	)),
 ]
 
 OCR_MIN_TEXT_CONFIDENCE = float(os.getenv("OCR_MIN_TEXT_CONFIDENCE", "0.15"))
@@ -202,18 +221,18 @@ FAST_OCR_MAX_EDGE = max(768, int(os.getenv("FAST_OCR_MAX_EDGE", "1280")))
 # Re-enable Ollama with better error handling
 OLLAMA_ENABLED = os.getenv("OLLAMA_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3-mini")  # Use phi3-mini for faster inference
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")  # Expert-level: Use llama3.1 for maximum accuracy
 # Comma-separated list of Ollama models to consult (e.g. "phi3-mini,llama3.2")
 OLLAMA_MODELS = os.getenv("OLLAMA_MODELS", OLLAMA_MODEL)
-OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "20"))
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "30"))
 # Per-request HTTP timeout for /analyze_fast. Keep this short so the fast path stays responsive.
-OLLAMA_FAST_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_FAST_TIMEOUT_SECONDS", "8"))
+OLLAMA_FAST_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_FAST_TIMEOUT_SECONDS", "15"))
 # Total wall-clock time the API will wait for Ollama to finish (includes cold-start load).
 OLLAMA_COMPLETION_TIMEOUT_SECONDS = int(
 	os.getenv("OLLAMA_COMPLETION_TIMEOUT_SECONDS", str(max(OLLAMA_FAST_TIMEOUT_SECONDS + 2, 10)))
 )
 # When true, final counts follow Ollama output. Default to false so visual detections stay authoritative.
-OLLAMA_TRUST_COUNTS = os.getenv("OLLAMA_TRUST_COUNTS", "false").strip().lower() in {"1", "true", "yes", "on"}
+OLLAMA_TRUST_COUNTS = os.getenv("OLLAMA_TRUST_COUNTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 # When false, Ollama is skipped in the count path for speed and determinism.
 # Expert-level: Enable Ollama verification by default for maximum accuracy
 OLLAMA_USE_FOR_COUNTS = os.getenv("OLLAMA_USE_FOR_COUNTS", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -223,9 +242,9 @@ TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("TEMPLATE_MAX_PER_CATEGORY", "1
 TEMPLATE_MATCH_MAX_EDGE = max(640, int(os.getenv("TEMPLATE_MATCH_MAX_EDGE", "1920")))
 TEMPLATE_MAX_PEAKS = max(5, int(os.getenv("TEMPLATE_MAX_PEAKS", "50")))
 TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("TEMPLATE_MATCH_TIMEOUT_SECONDS", "60"))
-FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS", "25"))
-FAST_TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("FAST_TEMPLATE_MAX_PER_CATEGORY", "35")))
-FAST_TEMPLATE_MAX_TOTAL = max(4, int(os.getenv("FAST_TEMPLATE_MAX_TOTAL", "80")))
+FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS", "30"))
+FAST_TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("FAST_TEMPLATE_MAX_PER_CATEGORY", "50")))
+FAST_TEMPLATE_MAX_TOTAL = max(4, int(os.getenv("FAST_TEMPLATE_MAX_TOTAL", "100")))
 FAST_MATCH_RELEVANT_ONLY = os.getenv("FAST_MATCH_RELEVANT_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"}
 FAST_DISABLE_ORB_OVER_TEMPLATE_COUNT = max(0, int(os.getenv("FAST_DISABLE_ORB_OVER_TEMPLATE_COUNT", "0")))
 FAST_OLLAMA_WAIT_CAP_SECONDS = float(os.getenv("FAST_OLLAMA_WAIT_CAP_SECONDS", "8"))
@@ -235,15 +254,36 @@ FAST_OLLAMA_TEXT_CHARS = max(800, int(os.getenv("FAST_OLLAMA_TEXT_CHARS", "2200"
 # Minimum confidence required to count a visual detection for each category.
 # Expert-level: Very low thresholds for maximum recall - further lowered for better accuracy
 CONF_THRESH: dict[str, float] = {
-	"motor": 0.15,
-	"pump": 0.20,
-	"tank": 0.15,
-	"valve": 0.18,
+	"motor": 0.08,
+	"pump": 0.08,
+	"tank": 0.08,
+	"valve": 0.08,
+	"instrument": 0.08,
+}
+
+# Higher confidence thresholds for fast mode to reduce false positives
+FAST_CONF_THRESH: dict[str, float] = {
+	"motor": 0.08,
+	"pump": 0.08,
+	"tank": 0.08,
+	"valve": 0.08,
+	"instrument": 0.08,
 }
 
 
 def empty_counts() -> dict[str, int]:
 	return {key: 0 for key in COUNT_KEYS}
+
+
+def normalize_pid_category(category: str | None) -> str | None:
+	if not category:
+		return None
+	candidate = str(category).strip().lower()
+	if candidate == "sensor":
+		return "instrument"
+	if candidate in COUNT_KEYS:
+		return candidate
+	return None
 
 
 def clamp(value: int, lower: int, upper: int) -> int:
@@ -277,7 +317,8 @@ def prepare_ocr_image(image_array: np.ndarray, fast_mode: bool = False) -> np.nd
 	h, w = image_array.shape[:2]
 	max_edge = max(h, w)
 	prepared = image_array
-	target_edge = FAST_OCR_MAX_EDGE if fast_mode else 3200
+	# Performance optimization: reduce target edge in fast mode for faster OCR
+	target_edge = (FAST_OCR_MAX_EDGE if fast_mode else 3200) if not fast_mode else 1024
 	if max_edge < target_edge:
 		scale = float(target_edge) / max_edge
 		prepared = cv2.resize(image_array, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
@@ -291,8 +332,9 @@ def prepare_ocr_image(image_array: np.ndarray, fast_mode: bool = False) -> np.nd
 		gray = cv2.fastNlMeansDenoising(gray, h=5)
 	
 	# Expert-level: Very high CLAHE clip limit for maximum contrast
+	# Performance optimization: reduce CLAHE intensity in fast mode
 	clahe = cv2.createCLAHE(
-		clipLimit=(2.2 if fast_mode else 4.5),
+		clipLimit=(1.8 if fast_mode else 4.5),
 		tileGridSize=((8, 8) if fast_mode else (6, 6)),
 	)
 	boosted = clahe.apply(gray)
@@ -303,18 +345,21 @@ def prepare_ocr_image(image_array: np.ndarray, fast_mode: bool = False) -> np.nd
 		boosted = cv2.morphologyEx(boosted, cv2.MORPH_CLOSE, kernel)
 		boosted = cv2.morphologyEx(boosted, cv2.MORPH_OPEN, kernel)
 	
-	# Unsharp masking for clearer text - very strong enhancement
-	gaussian = cv2.GaussianBlur(boosted, (0, 0), (0.8 if fast_mode else 1.2))
-	sharpened = cv2.addWeighted(
-		boosted,
-		(1.5 if fast_mode else 2.2),
-		gaussian,
-		(-0.5 if fast_mode else -1.2),
-		0,
-	)
-	
-	# Additional contrast boost
-	sharpened = cv2.normalize(sharpened, None, 0, 255, cv2.NORM_MINMAX)
+	# Performance optimization: skip unsharp masking in fast mode for speed
+	if not fast_mode:
+		# Unsharp masking for clearer text - very strong enhancement
+		gaussian = cv2.GaussianBlur(boosted, (0, 0), (0.8 if fast_mode else 1.2))
+		sharpened = cv2.addWeighted(
+			boosted,
+			(1.5 if fast_mode else 2.2),
+			gaussian,
+			(-0.5 if fast_mode else -1.2),
+			0,
+		)
+		# Additional contrast boost
+		sharpened = cv2.normalize(sharpened, None, 0, 255, cv2.NORM_MINMAX)
+	else:
+		sharpened = boosted
 	
 	return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
 
@@ -545,9 +590,9 @@ def classify_text_label(text: str) -> str | None:
 	if not normalized:
 		return None
 
-	# Instrument bubble tags must never be classified as physical components
+	# Instrument bubble tags are valid P&ID components in the instrument category.
 	if is_instrument_tag(normalized):
-		return None
+		return "instrument"
 	
 	# First check regex patterns (most precise)
 	for category, patterns in CATEGORY_REGEX_PATTERNS:
@@ -560,20 +605,29 @@ def classify_text_label(text: str) -> str | None:
 			return category
 	
 	# Enhanced fallback: check for single-letter initial tags like 'm-123', 'p123', 't 45'
+	# Only use this if the text looks like a proper tag (short, with numbers or hyphens)
 	initial_candidate = _infer_category_from_initial(normalized)
 	if initial_candidate:
 		return initial_candidate
 	
-	# Additional fallback: check for common P&ID tag patterns without numbers
-	# This catches labels like "MTR", "PMP", "TK", "VLV" etc
-	if any(x in normalized for x in ["mtr", "motor"]):
-		return "motor"
-	if any(x in normalized for x in ["pmp", "pump"]):
-		return "pump"
-	if any(x in normalized for x in ["tk", "tank", "vessel"]):
-		return "tank"
-	if any(x in normalized for x in ["vlv", "valve"]):
-		return "valve"
+	# Improved fallback: more precise word-boundary matching for common P&ID labels
+	# This catches labels like "MTR", "PMP", "TK", "VLV" etc without false positives
+	words = re.findall(r'\b[a-z]+\b', normalized)
+	for word in words:
+		# Check for exact matches or common abbreviations
+		if word in ("mtr", "motor"):
+			return "motor"
+		if word in ("pmp", "pump"):
+			return "pump"
+		if word in ("tk", "tank", "vessel"):
+			return "tank"
+		if word in ("vlv", "valve"):
+			return "valve"
+		# Check for single-letter tags with numbers (e.g., "v1", "m2")
+		if len(word) >= 2 and word[0].isalpha() and word[1:].isdigit():
+			first_char = word[0].lower()
+			if first_char in INITIAL_PREFIX_MAP:
+				return INITIAL_PREFIX_MAP[first_char]
 	
 	return None
 
@@ -595,8 +649,14 @@ def _infer_category_from_initial(text: str) -> str | None:
 	mapped = INITIAL_PREFIX_MAP.get(first)
 	if not mapped:
 		return None
-	# Accept if the text is short or starts with letter+digit/hyphen (common P&ID tags)
-	if len(text) <= 4 or (len(text) > 1 and (text[1].isdigit() or text[1] in "-_")):
+	# More restrictive: only accept if text clearly looks like a P&ID tag
+	# Must have a digit or hyphen immediately after the letter, or be very short
+	if len(text) <= 3:
+		# Very short text like "m1", "p2", "v3"
+		if len(text) >= 2 and text[1].isdigit():
+			return mapped
+	elif len(text) > 1 and (text[1].isdigit() or text[1] in "-_"):
+		# Text starts with letter followed by digit or hyphen like "m-123", "p123"
 		return mapped
 	return None
 
@@ -1136,7 +1196,7 @@ def detect_shape_components(
 ) -> list[dict[str, Any]]:
 	# Downscale for faster contour detection, then rescale coordinates back to original.
 	# Expert-level: Higher resolution for better small component detection - increased for better accuracy
-	max_edge = int(os.getenv("SHAPE_DETECT_MAX_EDGE", "2048"))
+	max_edge = int(os.getenv("SHAPE_DETECT_MAX_EDGE", "2560"))
 	orig_h, orig_w = image_array.shape[0], image_array.shape[1]
 	image_area = orig_h * orig_w
 	scale = 1.0
@@ -1154,7 +1214,7 @@ def detect_shape_components(
 	candidates: list[dict[str, Any]] = []
 	
 	# Expert-level: Process more contours for better coverage - increased for better accuracy
-	max_contours = int(os.getenv("SHAPE_DETECT_MAX_CONTOURS", "3000"))
+	max_contours = int(os.getenv("SHAPE_DETECT_MAX_CONTOURS", "5000"))
 	if len(contours) > max_contours:
 		contours = sorted(contours, key=cv2.contourArea, reverse=True)[:max_contours]
 
@@ -2197,6 +2257,12 @@ def ensemble_vote_detections(
 		method_weights = {"template": 1.0, "ssim": 1.0, "feature": 0.8, "shape": 0.6, "edge": 0.7}
 		weighted_boost = sum(method_weights.get(s, 0.5) for s in sources) / len(sources)
 		confidence_boost = min(0.35, weighted_boost * 0.18)
+		
+		# Accuracy optimization: require multiple detection sources for very low-confidence detections
+		# Single-source detections with very low confidence are likely false positives
+		# Adjusted threshold to avoid filtering valid detections
+		if source_count == 1 and base_confidence < 0.40:
+			continue  # Skip single-source very low-confidence detections to reduce false positives
 		merged["confidence"] = min(0.99, base_confidence + confidence_boost)
 		
 		# Update source indicator
@@ -2942,7 +3008,12 @@ def detections_to_coordinates_payload(
 		if category in COUNT_KEYS:
 			component_type = "ia.display.view"
 			category_counters[category] += 1
-			component_name = f"{category.title()}_{category_counters[category]}"
+			# Include OCR text if available for better component naming
+			ocr_name = detection.get("name", "")
+			if ocr_name and isinstance(ocr_name, str) and ocr_name.strip():
+				component_name = f"{category.title()}_{category_counters[category]}_{ocr_name.strip()}"
+			else:
+				component_name = f"{category.title()}_{category_counters[category]}"
 		else:
 			component_type = "ia.display.label"
 			label_counter += 1
@@ -3187,7 +3258,8 @@ async def analyze_pid_image_async(
 		# Use full template set (all categories) with expert-level thresholds
 		template_stage_start = time.perf_counter()
 		try:
-			template_threshold = 0.45  # Lowered threshold for maximum template matching accuracy
+			# Performance & accuracy optimization: higher threshold in fast mode to reduce false positives
+			template_threshold = 0.55 if fast_mode else 0.45  # Lowered threshold for maximum template matching accuracy
 			if fast_mode and FAST_MATCH_RELEVANT_ONLY:
 				relevant_categories = select_relevant_template_categories(
 					shape_component_detections,
@@ -3585,10 +3657,13 @@ async def analyze_pid_image_async(
 
 	# Valve-specific suppression: removes nearby duplicate valve-like candidates
 	# (common failure mode is counting an extra check/control valve shape twice).
+	# Moderate suppression in fast mode to balance precision/recall
+	valve_iou_thresh = 0.38 if fast_mode else 0.35
+	valve_center_dist = 0.75 if fast_mode else 0.80
 	merged_components = suppress_nearby_valves(
 		merged_components,
-		iou_threshold=0.35,
-		center_dist_ratio=0.80,
+		iou_threshold=valve_iou_thresh,
+		center_dist_ratio=valve_center_dist,
 		area_ratio_min=0.50,
 		area_ratio_max=2.00,
 	)
@@ -3627,7 +3702,8 @@ async def analyze_pid_image_async(
 
 	# Fixed confidence thresholds — no adaptive raising based on detection count,
 	# which was incorrectly dropping valid detections when a category had >3 hits
-	active_thresh = CONF_THRESH.copy()
+	# Use higher thresholds in fast mode to reduce false positives
+	active_thresh = FAST_CONF_THRESH.copy() if fast_mode else CONF_THRESH.copy()
 
 	# Post-process: suppress candidates the active-learning model is uncertain about.
 	# If a candidate does not strongly match the reference images, reduce its confidence.
@@ -3779,17 +3855,30 @@ async def analyze_pid_image_async(
 			ollama_val = int(phi3_counts.get(key, 0) or 0)
 			current = int(combined_counts.get(key, 0))
 			visual_val = int(visual_counts.get(key, 0))
-			# In fast_mode, keep CV/OCR detections authoritative.
-			# A single quick Ollama pass is useful for hints, but should never reduce
-			# deterministic counts because that causes avoidable under-count regressions.
+			# In fast_mode, keep CV/OCR detections authoritative but allow Ollama to reduce obvious false positives.
+			# A single quick Ollama pass is useful for hints, and can reduce counts when CV clearly over-detects.
 			if fast_mode:
 				text_val = int(text_counts.get(key, 0) or 0)
-				# Deterministic floor from existing CV/OCR stages.
-				deterministic_floor = max(current, text_val)
-				combined_counts[key] = deterministic_floor
-				# Allow upward correction only when vision saw none.
-				if visual_val == 0 and ollama_val > deterministic_floor:
+				# Deterministic floor from text evidence (OCR is more reliable than shape/template for counts)
+				text_floor = max(text_val, 0)
+				
+				# Allow Ollama to reduce counts when:
+				# 1. Ollama value is lower than current AND
+				# 2. Text evidence supports Ollama (or is neutral) AND
+				# 3. The reduction is reasonable (not too aggressive)
+				if ollama_val < current and ollama_val >= text_floor:
+					# Only reduce if the difference is reasonable (avoid aggressive corrections)
+					if current - ollama_val <= 2:  # Allow reduction of up to 2 false positives
+						combined_counts[key] = ollama_val
+					else:
+						# Conservative: use text floor as minimum
+						combined_counts[key] = max(text_floor, ollama_val)
+				# Allow upward correction when vision saw none
+				elif visual_val == 0 and ollama_val > current:
 					combined_counts[key] = ollama_val
+				else:
+					# Keep current count
+					combined_counts[key] = current
 				continue
 			# Non-fast mode: allow Ollama to correct over-counts and add missing classes.
 			if ollama_val < current:
