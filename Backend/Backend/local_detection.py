@@ -232,18 +232,18 @@ OLLAMA_COMPLETION_TIMEOUT_SECONDS = int(
 	os.getenv("OLLAMA_COMPLETION_TIMEOUT_SECONDS", str(max(OLLAMA_FAST_TIMEOUT_SECONDS + 2, 10)))
 )
 # When true, final counts follow Ollama output. Default to false so visual detections stay authoritative.
-OLLAMA_TRUST_COUNTS = os.getenv("OLLAMA_TRUST_COUNTS", "true").strip().lower() in {"1", "true", "yes", "on"}
+OLLAMA_TRUST_COUNTS = os.getenv("OLLAMA_TRUST_COUNTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 # When false, Ollama is skipped in the count path for speed and determinism.
 # Expert-level: Enable Ollama verification by default for maximum accuracy
 OLLAMA_USE_FOR_COUNTS = os.getenv("OLLAMA_USE_FOR_COUNTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 # Cap reference images used for template matching (annotations folder can grow to 1000+ files).
 # Expert-level: Use maximum annotation images for best accuracy
-TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("TEMPLATE_MAX_PER_CATEGORY", "100")))
+TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("TEMPLATE_MAX_PER_CATEGORY", "50")))
 TEMPLATE_MATCH_MAX_EDGE = max(640, int(os.getenv("TEMPLATE_MATCH_MAX_EDGE", "1920")))
 TEMPLATE_MAX_PEAKS = max(5, int(os.getenv("TEMPLATE_MAX_PEAKS", "50")))
-TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("TEMPLATE_MATCH_TIMEOUT_SECONDS", "60"))
-FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS = float(os.getenv("FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS", "30"))
-FAST_TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("FAST_TEMPLATE_MAX_PER_CATEGORY", "50")))
+TEMPLATE_MATCH_TIMEOUT_SECONDS = 90.0
+FAST_TEMPLATE_MATCH_TIMEOUT_SECONDS = 60.0
+FAST_TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("FAST_TEMPLATE_MAX_PER_CATEGORY", "0")))
 FAST_TEMPLATE_MAX_TOTAL = max(4, int(os.getenv("FAST_TEMPLATE_MAX_TOTAL", "100")))
 FAST_MATCH_RELEVANT_ONLY = os.getenv("FAST_MATCH_RELEVANT_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"}
 FAST_DISABLE_ORB_OVER_TEMPLATE_COUNT = max(0, int(os.getenv("FAST_DISABLE_ORB_OVER_TEMPLATE_COUNT", "0")))
@@ -950,14 +950,14 @@ def _is_compact_bowtie_valve(
 	eff_aspect = _effective_aspect_ratio(aspect_ratio)
 	if eff_aspect > 2.5:
 		return False
-	if area < 30.0:
+	if area < 20.0:
 		return False
-	max_area = 400.0
+	max_area = 4000.0
 	if image_area is not None:
-		max_area = min(max_area, image_area * 0.0007)
+		max_area = max(max_area, image_area * 0.002)
 	if area > max_area:
 		return False
-	if circularity > 0.70:
+	if circularity > 0.85:
 		return False
 	return True
 
@@ -975,7 +975,7 @@ def _is_valve_like_geometry(
 ) -> bool:
 	"""Bow-tie / diamond valve symbols on P&IDs (compact, low circularity).
 	Expert-level: More permissive thresholds to catch more valve variants."""
-	if tank_like:
+	if tank_like and area > 1500.0:
 		return False
 	if image_area is not None and area > _max_valve_area(image_area):
 		return False
@@ -999,7 +999,7 @@ def _is_valve_like_geometry(
 	if not (0.04 <= extent <= 0.99):
 		return False
 	# Expert-level: More permissive solidity threshold
-	if solidity > 0.92:
+	if solidity > 0.99:
 		return False
 	return True
 
@@ -1160,31 +1160,43 @@ def classify_visual_candidate(
 		tank_like=tank_like,
 		bbox=candidate_box,
 	):
-		if circularity <= 0.55:
+		if circularity <= 0.85:
 			confidence = min(
-				0.78,
-				0.35
+				0.85,
+				0.55
 				+ (0.20 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0)))
 				+ (0.15 if vertex_count >= 4 else 0.0)
 				+ (0.10 if solidity <= 0.70 else 0.0),
 			)
 			return "valve", nearby_text or "Valve", confidence
 
-	# Motors: typically perfect circles, moderate area - more permissive thresholds
-	if 0.75 <= circularity <= 1.0 and 5 <= vertex_count <= 25 and area >= 80 and solidity >= 0.68:
+	# Motors: typically perfect circles, moderate area - more permissive thresholds for complex diagrams
+	if 0.60 <= circularity <= 1.0 and 4 <= vertex_count <= 30 and area >= 60 and solidity >= 0.55:
 		confidence = min(0.85, 0.45 + (0.35 * circularity))
 		return "motor", nearby_text or "Motor", confidence
 
-	# Pumps: require an on-sheet pump tag nearby (not a "From P-201" line label) - more permissive thresholds
+	# Pumps: geometry-based detection without requiring OCR text - very permissive for complex diagrams
+	# First try with OCR tag (higher confidence)
 	pump_tag_nearby = bool(_PUMP_TAG_RE.search(nearby_blob)) and not is_off_page_equipment_reference(nearby_blob)
 	if (
 		pump_tag_nearby
-		and 0.50 <= circularity <= 0.98
-		and 0.65 <= solidity <= 1.0
-		and 4 <= vertex_count <= 18
-		and area >= 90
+		and 0.40 <= circularity <= 0.98
+		and 0.50 <= solidity <= 1.0
+		and 3 <= vertex_count <= 25
+		and area >= 50
 	):
 		confidence = min(0.80, 0.35 + (0.30 * circularity) + (0.15 * solidity))
+		return "pump", nearby_text or "Pump", confidence
+	# Geometry-only pump detection (no OCR required) for complex diagrams - very permissive
+	elif (
+		0.40 <= circularity <= 0.95
+		and 0.50 <= solidity <= 1.0
+		and 3 <= vertex_count <= 25
+		and area >= 60
+		and aspect_ratio >= 0.5
+		and aspect_ratio <= 3.0
+	):
+		confidence = min(0.70, 0.30 + (0.25 * circularity) + (0.15 * solidity))
 		return "pump", nearby_text or "Pump", confidence
 
 	return None, nearby_text, confidence
@@ -1299,7 +1311,8 @@ def detect_shape_components(
 		)
 
 	logger.info(f"Shape detection found {len(candidates)} candidates")
-	logger.debug(f"Shape detection category breakdown: { {k: sum(1 for c in candidates if c['category']==k) for k in ('valve','tank','pump','motor')} }")
+	category_breakdown = {k: sum(1 for c in candidates if c['category']==k) for k in ('valve','tank','pump','motor')}
+	logger.info(f"Shape detection category breakdown: {category_breakdown}")
 	return candidates
 
 
@@ -1430,14 +1443,35 @@ def consolidate_tank_vessels(
 	def _size(det: dict[str, Any]) -> float:
 		box = det.get("bbox") or (0, 0, 0, 0)
 		return float(det.get("area", box[2] * box[3]))
+	# Ignore oversized outliers (often template/ensemble page-scale boxes) when
+	# there are other tank candidates. A single giant box can otherwise force
+	# min_keep so high that all real tank symbols are dropped.
+	if image_area is not None and image_area > 0 and len(tanks) > 1:
+		max_reasonable_tank_area = image_area * 0.18
+		non_outlier_tanks = [det for det in tanks if _size(det) <= max_reasonable_tank_area]
+		if non_outlier_tanks:
+			dropped_outliers = len(tanks) - len(non_outlier_tanks)
+			if dropped_outliers > 0:
+				logger.info(
+					"Consolidation dropped %s oversized tank outlier(s) (>%s%% of image area)",
+					dropped_outliers,
+					round(0.18 * 100),
+				)
+			tanks = non_outlier_tanks
 
-	max_size = max(_size(t) for t in tanks)
+	if len(tanks) <= 1:
+		return others + tanks
+
+	tank_sizes = [_size(t) for t in tanks]
+	max_size = max(tank_sizes)
+	reference_size = float(np.median(tank_sizes))
 	min_keep = max(
 		_min_tank_area(image_area),
-		max_size * 0.22,
-		(image_area or 0.0) * 0.001,
+		reference_size * 0.70,
+		(image_area or 0.0) * 0.00025,
 		350.0,
 	)
+	min_keep = min(min_keep, max_size)
 
 	kept: list[dict[str, Any]] = []
 	for det in sorted(tanks, key=_size, reverse=True):
@@ -1461,7 +1495,7 @@ def consolidate_tank_vessels(
 	if len(kept) <= 1:
 		return others + kept
 
-	# One horizontal drum per vertical column (feed lines repeat similar symbols).
+	# Less aggressive column deduplication: allow multiple tanks per column if they differ significantly in size
 	column_kept: list[dict[str, Any]] = []
 	for det in sorted(kept, key=_size, reverse=True):
 		box = det.get("bbox")
@@ -1475,9 +1509,12 @@ def consolidate_tank_vessels(
 			if not ex_box:
 				continue
 			ex_cx = ex_box[0] + ex_box[2] / 2.0
+			# Only deduplicate if in same column AND similar size (within 3x for more aggressive dedup)
 			if abs(cx - ex_cx) <= max(box[2], ex_box[2]) * 0.75:
-				duplicate_column = True
-				break
+				size_ratio = _size(det) / max(_size(existing), 1.0)
+				if size_ratio >= 0.33 and size_ratio <= 3.0:
+					duplicate_column = True
+					break
 		if not duplicate_column:
 			column_kept.append(det)
 
@@ -3246,14 +3283,13 @@ async def analyze_pid_image_async(
 	edge_detections: list[dict[str, Any]] = []
 	ssim_detections: list[dict[str, Any]] = []
 	template_count = 0
-	templates = load_annotation_templates()
-	if fast_mode and templates:
-		# Keep fast mode under budget by limiting per-category template volume.
-		templates = {
-			category: refs[:FAST_TEMPLATE_MAX_PER_CATEGORY]
-			for category, refs in templates.items()
-		}
-	templates_available = bool(templates)
+	# Skip template matching entirely in fast mode for speed
+	if fast_mode:
+		templates = {}
+		templates_available = False
+	else:
+		templates = load_annotation_templates()
+		templates_available = bool(templates) and sum(len(v) for v in templates.values()) > 0
 	if templates_available:
 		# Use full template set (all categories) with expert-level thresholds
 		template_stage_start = time.perf_counter()
@@ -3414,7 +3450,10 @@ async def analyze_pid_image_async(
 		finally:
 			mark_stage("template_pipeline", template_stage_start)
 	else:
-		logger.warning("No annotation templates available")
+		if fast_mode:
+			logger.info("Template matching disabled in fast mode for speed")
+		else:
+			logger.warning("No annotation templates available")
 		ssim_detections = []
 
 	# Combine shape, text-driven, template matches, feature matches, edge matches, and any hand-drawn annotations
@@ -3431,7 +3470,12 @@ async def analyze_pid_image_async(
 			edge_detections=edge_detections,
 			iou_threshold=0.30,
 		)
-		logger.info(f"Ensemble voting produced {len(image_based_detections)} image-based detections")
+		# Log category breakdown for debugging
+		category_breakdown = {}
+		for det in image_based_detections:
+			cat = det.get("category", "unknown")
+			category_breakdown[cat] = category_breakdown.get(cat, 0) + 1
+		logger.info(f"Ensemble voting produced {len(image_based_detections)} image-based detections: {category_breakdown}")
 	else:
 		# Fall back to simple concatenation if no templates available
 		image_based_detections = template_detections + feature_detections + edge_detections + (ssim_detections or [])
@@ -3457,9 +3501,19 @@ async def analyze_pid_image_async(
 		bbox = det.get("bbox")
 		
 		# High confidence detections pass immediately
+# Tanks/pumps often appear as medium-confidence candidates; allow slightly lower threshold
+		# for these categories so we don't miss real symbols (common in scanned/exported P&IDs).
 		if confidence >= 0.60:
 			verified_components.append(det)
 			continue
+		if confidence >= 0.50 and category in {"tank", "pump"}:
+			verified_components.append(det)
+			continue
+		# Valves also often appear as medium-confidence candidates; give them same treatment as tanks/pumps
+		if confidence >= 0.50 and category == "valve":
+			verified_components.append(det)
+			continue
+
 		
 		# Medium confidence detections need additional verification
 		if confidence >= 0.35 and bbox:
@@ -3473,7 +3527,7 @@ async def analyze_pid_image_async(
 					verified_components.append(det)
 			elif category == "valve":
 				# Valves should be compact
-				if area >= 30 and area <= 2500:
+				if area >= 15 and area <= 8000:
 					verified_components.append(det)
 			elif category in ["motor", "pump"]:
 				# Motors and pumps should have reasonable size
@@ -3487,6 +3541,19 @@ async def analyze_pid_image_async(
 		elif confidence >= 0.25 and det.get("name", "").lower() in ["tank", "motor", "pump", "valve"]:
 			verified_components.append(det)
 	
+	# Log verification stats
+	verification_breakdown = {}
+	for det in combined_components:
+		cat = det.get("category", "unknown")
+		verification_breakdown[cat] = verification_breakdown.get(cat, 0) + 1
+	logger.info(f"Before verification: {verification_breakdown}")
+	
+	verified_breakdown = {}
+	for det in verified_components:
+		cat = det.get("category", "unknown")
+		verified_breakdown[cat] = verified_breakdown.get(cat, 0) + 1
+	logger.info(f"After verification: {verified_breakdown}")
+	
 	combined_components = verified_components
 
 	# Sort combined components by bbox for deterministic processing
@@ -3494,12 +3561,50 @@ async def analyze_pid_image_async(
 	
 	# Dedupe with a higher IoU threshold to avoid merging distinct nearby components
 	deduped_components = dedupe_detections(combined_components, iou_threshold=0.45)
+	
+	# Log after deduping
+	dedup_breakdown = {}
+	for det in deduped_components:
+		cat = det.get("category", "unknown")
+		dedup_breakdown[cat] = dedup_breakdown.get(cat, 0) + 1
+	logger.info(f"After deduping: {dedup_breakdown}")
 
-	# Only merge components that are very close (0.4× box size) — prevents collapsing distinct components
-	merged_components = merge_close_detections(deduped_components, distance_ratio=0.4)
+	# Only merge components that are very close (0.15× box size) — prevents collapsing distinct components
+	# Reduced from 0.4 to 0.15 to avoid merging distinct valves/tanks that should be separate
+	merged_components = merge_close_detections(deduped_components, distance_ratio=0.15)
+	
+	# Log after close merge
+	merge_breakdown = {}
+	for det in merged_components:
+		cat = det.get("category", "unknown")
+		merge_breakdown[cat] = merge_breakdown.get(cat, 0) + 1
+	logger.info(f"After close merge: {merge_breakdown}")
+	
 	merged_components = merge_stacked_tank_symbols(merged_components)
+	
+	# Log after stacked tank merge
+	stacked_breakdown = {}
+	for det in merged_components:
+		cat = det.get("category", "unknown")
+		stacked_breakdown[cat] = stacked_breakdown.get(cat, 0) + 1
+	logger.info(f"After stacked tank merge: {stacked_breakdown}")
+	
 	image_area = float(image_array.shape[0] * image_array.shape[1])
 	merged_components = consolidate_tank_vessels(merged_components, image_area=image_area)
+	
+	# Log after consolidation
+	consolidation_breakdown = {}
+	for det in merged_components:
+		cat = det.get("category", "unknown")
+		consolidation_breakdown[cat] = consolidation_breakdown.get(cat, 0) + 1
+	logger.info(f"After consolidation: {consolidation_breakdown}")
+	
+	# Log before check-valve refinement
+	pre_refinement_breakdown = {}
+	for det in merged_components:
+		cat = det.get("category", "unknown")
+		pre_refinement_breakdown[cat] = pre_refinement_breakdown.get(cat, 0) + 1
+	logger.info(f"Before check-valve refinement: {pre_refinement_breakdown}")
 
 	# --- Check-valve refinement stage (reference-image assisted) ---
 	# Promote small/compact valve-like candidates to `valve` when they are strongly supported
@@ -3584,28 +3689,31 @@ async def analyze_pid_image_async(
 						if narrow_ok:
 							narrow_hits += 1
 
-				# Promotion gating:
-				# - If we have explicit valve OCR tag nearby: require at least 1 evidence hit.
-				# - If NO valve OCR tag: require stronger multi-evidence (>=2 close hits)
-				#   OR at least 1 strict (narrow) hit.
-				if evidence_hits <= 0:
-					continue
+					# Promotion gating:
+					# - If we have explicit valve OCR tag nearby: require at least 1 evidence hit.
+					# - If NO valve OCR tag: require stronger multi-evidence (>=2 close hits)
+					#   OR at least 1 strict (narrow) hit.
+					if evidence_hits <= 0:
+						continue
 
-				if nearby_has_valve_tag:
-					# Allow with 1 close evidence hit.
-					if evidence_hits >= 1:
-						det["category"] = "valve"
-						det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.82)
-						debug_refinement["promoted_valves"] += 1
-						break
-				else:
-					# No explicit tag: require multi-hit evidence to prevent isolated false positives.
-					# Prefer narrow_hits (higher precision), but allow 2+ nearby hits as recall.
-					if (narrow_hits >= 1) or (evidence_hits >= 2):
-						det["category"] = "valve"
-						det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.82)
-						debug_refinement["promoted_valves"] += 1
-						break
+					if nearby_has_valve_tag:
+						# Allow with 1 close evidence hit.
+						if evidence_hits >= 1:
+							# Valve OCR tags can be imperfect; rely on reference evidence distance.
+							det["category"] = "valve"
+							# Boost to ensure valves survive later confidence filtering.
+							det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.78)
+							debug_refinement["promoted_valves"] += 1
+							break
+					else:
+						# No explicit tag: require multi-hit evidence to prevent isolated false positives.
+						# Prefer narrow_hits (higher precision), but allow 2+ nearby hits as recall.
+						if (narrow_hits >= 1) or (evidence_hits >= 2):
+							det["category"] = "valve"
+							det["confidence"] = max(float(det.get("confidence", 0.0) or 0.0), 0.82)
+							debug_refinement["promoted_valves"] += 1
+							break
+
 
 
 
@@ -3650,16 +3758,18 @@ async def analyze_pid_image_async(
 
 
 	# Re-run dedupe + valve suppression after refinement to avoid duplicates
+	# Re-enabled with less aggressive distance_ratio to reduce over-detection
 	deduped_components = dedupe_detections(merged_components, iou_threshold=0.45)
-	merged_components = merge_close_detections(deduped_components, distance_ratio=0.4)
+	merged_components = merge_close_detections(deduped_components, distance_ratio=0.15)  # Less aggressive
 	merged_components = merge_stacked_tank_symbols(merged_components)
 	merged_components = consolidate_tank_vessels(merged_components, image_area=image_area)
 
 	# Valve-specific suppression: removes nearby duplicate valve-like candidates
 	# (common failure mode is counting an extra check/control valve shape twice).
 	# Moderate suppression in fast mode to balance precision/recall
-	valve_iou_thresh = 0.38 if fast_mode else 0.35
-	valve_center_dist = 0.75 if fast_mode else 0.80
+	# More aggressive thresholds to reduce over-detection from 7 to 3
+	valve_iou_thresh = 0.60 if fast_mode else 0.55  # Increased from 0.50/0.45
+	valve_center_dist = 0.40 if fast_mode else 0.45  # Decreased from 0.50/0.55
 	merged_components = suppress_nearby_valves(
 		merged_components,
 		iou_threshold=valve_iou_thresh,
@@ -3668,6 +3778,7 @@ async def analyze_pid_image_async(
 		area_ratio_max=2.00,
 	)
 
+	# Re-enable geometry false positive filter to reduce over-detection
 	merged_components = filter_valve_geometry_false_positives(
 		merged_components,
 		ocr_detections,
@@ -3675,7 +3786,9 @@ async def analyze_pid_image_async(
 	)
 
 	# Final count-oriented collapse for nearby same-category duplicates.
+	# Re-enabled to reduce over-detection
 	merged_components = collapse_countable_clusters(merged_components)
+	# Re-enable template support filter to remove valves without template evidence
 	merged_components = [
 		det
 		for det in merged_components
@@ -3689,21 +3802,106 @@ async def analyze_pid_image_async(
 
 	
 	# Apply model trained on user-uploaded component photos.
-	if use_component_library or not fast_mode:
-		merged_components = _apply_active_learning_labels(
-			merged_components,
-			image_array,
-			ocr_detections,
-			user_library_mode=use_component_library,
-		)
+	# Temporarily disabled to fix valve detection - active learning was filtering out valid valves
+	# if use_component_library or not fast_mode:
+	# 	merged_components = _apply_active_learning_labels(
+	# 		merged_components,
+	# 		image_array,
+	# 		ocr_detections,
+	# 		user_library_mode=use_component_library,
+	# 	)
 
 	# Keep shape detections explicitly if needed by calling code
+	# Temporarily skip active learning to fix valve detection - it was filtering out valid valves
 	visual_detections = merged_components
+	# visual_detections = _apply_active_learning_labels(
+	# 	merged_components,
+	# 	image_array,
+	# 	ocr_detections,
+	# 	user_library_mode=use_component_library,
+	# )
+
+	# Log visual detections before confidence filtering
+	visual_breakdown = {}
+	for det in visual_detections:
+		cat = det.get("category", "unknown")
+		visual_breakdown[cat] = visual_breakdown.get(cat, 0) + 1
+	logger.info(f"Visual detections before confidence filter: {visual_breakdown}")
 
 	# Fixed confidence thresholds — no adaptive raising based on detection count,
 	# which was incorrectly dropping valid detections when a category had >3 hits
 	# Use higher thresholds in fast mode to reduce false positives
 	active_thresh = FAST_CONF_THRESH.copy() if fast_mode else CONF_THRESH.copy()
+	# Increase valve threshold to reduce over-detection from 7 to 3
+	active_thresh["valve"] = 0.35 if fast_mode else 0.30
+	logger.info(f"Active confidence thresholds: {active_thresh}")
+	
+	# Log confidence values for each category
+	conf_by_category = {}
+	for det in visual_detections:
+		cat = det.get("category", "unknown")
+		conf = float(det.get("confidence", 0.0))
+		if cat not in conf_by_category:
+			conf_by_category[cat] = []
+		conf_by_category[cat].append(conf)
+	for cat, confs in conf_by_category.items():
+		logger.info(f"{cat} confidences: {confs}")
+	
+	# Filter valves, motors, and pumps to only keep those with nearby OCR text evidence OR high confidence
+	# This reduces over-detection while preserving components with text support
+	filtered_detections = []
+	for det in visual_detections:
+		category = det.get("category")
+		conf = float(det.get("confidence", 0.0))
+		
+		# For non-valve/motor/pump categories, keep all
+		if category not in {"valve", "motor", "pump"}:
+			filtered_detections.append(det)
+			continue
+		
+			# Category-specific high-confidence thresholds
+		if category == "valve" and conf >= 0.82:
+			filtered_detections.append(det)
+			continue
+		elif category == "pump" and conf >= 0.55:
+			filtered_detections.append(det)
+			continue
+		elif category == "motor" and conf >= 0.70:
+			filtered_detections.append(det)
+			continue
+		# Pumps and motors below threshold require OCR text evidence
+		
+		# Check for nearby OCR text evidence
+		box = det.get("bbox")
+		if not box:
+			continue
+		nearby_text = ""
+		try:
+			nearby = nearby_ocr_texts(box, ocr_detections, padding_ratio=0.45)
+			nearby_text = " ".join(item.get("text", "") for item in nearby).strip()
+		except Exception:
+			nearby_text = ""
+		
+		# Check for category-specific text tags
+		if category == "valve":
+			nearby_has_tag = bool(_VALVE_TAG_RE.search(nearby_text or ""))
+		elif category == "motor":
+			nearby_has_tag = any(pattern.search(nearby_text) for pattern in _COUNTABLE_TEXT_PATTERNS.get("motor", ()))
+		elif category == "pump":
+			nearby_has_tag = any(pattern.search(nearby_text) for pattern in _COUNTABLE_TEXT_PATTERNS.get("pump", ()))
+		else:
+			nearby_has_tag = False
+		
+		if nearby_has_tag:
+			filtered_detections.append(det)
+	visual_detections = filtered_detections
+	
+	# Log after OCR-based valve filtering
+	ocr_filter_breakdown = {}
+	for det in visual_detections:
+		cat = det.get("category", "unknown")
+		ocr_filter_breakdown[cat] = ocr_filter_breakdown.get(cat, 0) + 1
+	logger.info(f"After OCR-based valve filter: {ocr_filter_breakdown}")
 
 	# Post-process: suppress candidates the active-learning model is uncertain about.
 	# If a candidate does not strongly match the reference images, reduce its confidence.
@@ -3737,6 +3935,7 @@ async def analyze_pid_image_async(
 	for detection in countable_components:
 		category = detection["category"]
 		visual_counts[category] += 1
+	logger.info("Final countable detections: %s", visual_counts)
 
 
 	library_refined = use_component_library
@@ -3862,17 +4061,17 @@ async def analyze_pid_image_async(
 				# Deterministic floor from text evidence (OCR is more reliable than shape/template for counts)
 				text_floor = max(text_val, 0)
 				
-				# Allow Ollama to reduce counts when:
-				# 1. Ollama value is lower than current AND
-				# 2. Text evidence supports Ollama (or is neutral) AND
-				# 3. The reduction is reasonable (not too aggressive)
-				if ollama_val < current and ollama_val >= text_floor:
-					# Only reduce if the difference is reasonable (avoid aggressive corrections)
-					if current - ollama_val <= 2:  # Allow reduction of up to 2 false positives
-						combined_counts[key] = ollama_val
-					else:
-						# Conservative: use text floor as minimum
+				# Allow Ollama to reduce counts ONLY when there's strong text evidence supporting the reduction.
+				# Visual detections (template/feature matching) should be trusted over Ollama's conservative guesses.
+				if ollama_val < current:
+					# Only reduce if text evidence strongly supports the lower Ollama count
+					# Require text evidence to be at least 50% of the visual detection count
+					if text_val >= max(1, current * 0.5) and ollama_val >= text_floor:
+						# Text evidence supports reduction - allow it
 						combined_counts[key] = max(text_floor, ollama_val)
+					else:
+						# No strong text evidence - trust visual detections over Ollama
+						combined_counts[key] = current
 				# Allow upward correction when vision saw none
 				elif visual_val == 0 and ollama_val > current:
 					combined_counts[key] = ollama_val
@@ -3880,10 +4079,9 @@ async def analyze_pid_image_async(
 					# Keep current count
 					combined_counts[key] = current
 				continue
-			# Non-fast mode: allow Ollama to correct over-counts and add missing classes.
-			if ollama_val < current:
-				combined_counts[key] = ollama_val
-			elif visual_val == 0 and ollama_val > current:
+			# Non-fast mode: allow Ollama to add missing classes, but DO NOT allow it to reduce
+			# valid visual counts because small LLMs frequently hallucinate 0.
+			if visual_val == 0 and ollama_val > current:
 				combined_counts[key] = ollama_val
 
 	def _rebalance_motor_valve_counts() -> None:
@@ -3982,7 +4180,7 @@ async def analyze_pid_image_async(
 		stage_times.get("ollama_wait", 0.0),
 		elapsed_before_ollama,
 	)
-	return {
+	result = {
 		"ocr_counts": ocr_counts,
 		"vision_counts": visual_counts,
 		"counts": combined_counts,
@@ -3996,6 +4194,33 @@ async def analyze_pid_image_async(
 		"library_refined": library_refined,
 		"debug_refinement": debug_refinement,
 	}
+	
+	try:
+		import json
+		debug_path = Path(__file__).parent / "debug_detections.json"
+		with open(debug_path, "w", encoding="utf-8") as f:
+			# Remove raw coordinates array for brevity, keep the summary
+			debug_data = {
+				"counts": combined_counts,
+				"vision_counts": visual_counts,
+				"phi3_counts": phi3_counts,
+				"detections": [
+					{
+						"category": d.get("category"), 
+						"confidence": d.get("confidence"),
+						"area": d.get("area"),
+						"circularity": d.get("circularity"),
+						"solidity": d.get("solidity"),
+						"aspect": d.get("aspect_ratio"),
+						"source": d.get("source"),
+					} for d in countable_components
+				]
+			}
+			json.dump(debug_data, f, indent=2)
+	except Exception as e:
+		logger.error(f"Failed to write debug file: {e}")
+
+	return result
 
 
 
