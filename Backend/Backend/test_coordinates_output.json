@@ -1,0 +1,42 @@
+{
+  "custom": {},
+  "params": {},
+  "props": {
+    "defaultSize": {
+      "width": 713,
+      "height": 469
+    }
+  },
+  "root": {
+    "children": [
+      {
+        "meta": {
+          "name": "t1_Tank"
+        },
+        "position": {
+          "x": 0.2903225806451613,
+          "y": 0.24093816631130063,
+          "width": 0.17251051893408134,
+          "height": 0.4584221748400853
+        },
+        "props": {
+          "path": "Template/Tanks/Storage_Tank_2"
+        },
+        "type": "ia.display.view"
+      }
+    ],
+    "meta": {
+      "name": "root"
+    },
+    "position": {
+      "x": 0,
+      "y": 0
+    },
+    "props": {
+      "style": {
+        "backgroundColor": "#FFFFFF"
+      }
+    },
+    "type": "ia.container.coord"
+  }
+}

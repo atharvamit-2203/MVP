@@ -1,0 +1,64 @@
+{
+  "counts": {
+    "motor": 0,
+    "pump": 0,
+    "tank": 1,
+    "valve": 3,
+    "instrument": 0,
+    "other": 0
+  },
+  "vision_counts": {
+    "motor": 0,
+    "pump": 0,
+    "tank": 1,
+    "valve": 3,
+    "instrument": 0,
+    "other": 0
+  },
+  "phi3_counts": {
+    "motor": 0,
+    "pump": 0,
+    "tank": 1,
+    "valve": 3,
+    "instrument": 0,
+    "other": 0
+  },
+  "detections": [
+    {
+      "category": "tank",
+      "confidence": 0.7000000000000001,
+      "area": 25728.5,
+      "circularity": 0.7186733806150459,
+      "solidity": 0.9873740765614506,
+      "aspect": 0.5720930232558139,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.8272727272727274,
+      "area": 108.5,
+      "circularity": 0.5475796569925769,
+      "solidity": 0.8314176245210728,
+      "aspect": 1.3636363636363635,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.7727272727272728,
+      "area": 137.5,
+      "circularity": 0.5434866032456205,
+      "solidity": 0.8540372670807453,
+      "aspect": 1.6363636363636365,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.7727272727272728,
+      "area": 135.5,
+      "circularity": 0.5516730462016302,
+      "solidity": 0.8575949367088608,
+      "aspect": 1.6363636363636365,
+      "source": "shape"
+    }
+  ]
+}

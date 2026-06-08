@@ -79,7 +79,7 @@ async def _warmup_analysis_models() -> None:
 		await asyncio.wait_for(asyncio.to_thread(local_detection.get_ocr_engine), timeout=90)
 		# Build CV kernels/caches once on a tiny image.
 		dummy = np.zeros((96, 96, 3), dtype=np.uint8)
-		await asyncio.wait_for(asyncio.to_thread(local_detection.detect_shape_components, dummy, []), timeout=15)
+		await asyncio.wait_for(asyncio.to_thread(local_detection.detect_shape_components, dummy, [], "complex"), timeout=15)
 		# Warm model cache if available.
 		await asyncio.to_thread(_active_model_blob)
 		_analysis_warm = True
@@ -116,6 +116,8 @@ class CategoryCounts(BaseModel):
 	pump: int = Field(0, ge=0)
 	tank: int = Field(0, ge=0)
 	valve: int = Field(0, ge=0)
+	instrument: int = Field(0, ge=0)
+	other: int = Field(0, ge=0)
 
 
 class ModelDetectionResult(BaseModel):
@@ -357,6 +359,8 @@ def counts_to_model(counts: dict[str, int]) -> CategoryCounts:
 		pump=int(counts.get("pump", 0)),
 		tank=int(counts.get("tank", 0)),
 		valve=int(counts.get("valve", 0)),
+		instrument=int(counts.get("instrument", 0)),
+		other=int(counts.get("other", 0)),
 	)
 
 
@@ -366,6 +370,8 @@ def model_counts_to_dict(counts: CategoryCounts) -> dict[str, int]:
 		"pump": int(counts.pump),
 		"tank": int(counts.tank),
 		"valve": int(counts.valve),
+		"instrument": int(counts.instrument),
+		"other": int(counts.other),
 	}
 
 
@@ -428,16 +434,30 @@ def _scale_coordinates_to_original(
 		if not isinstance(position, dict):
 			continue
 		try:
-			x = int(float(position.get("x", 0)) * scale_x)
-			y = int(float(position.get("y", 0)) * scale_y)
-			width = int(float(position.get("width", 0)) * scale_x)
-			height = int(float(position.get("height", 0)) * scale_y)
+			raw_x = float(position.get("x", 0))
+			raw_y = float(position.get("y", 0))
+			raw_w = float(position.get("width", 0))
+			raw_h = float(position.get("height", 0))
+			
+			if raw_x > 1.0 or raw_y > 1.0 or raw_w > 1.0 or raw_h > 1.0:
+				# It is in pixels, scale it
+				x = int(raw_x * scale_x)
+				y = int(raw_y * scale_y)
+				width = int(raw_w * scale_x)
+				height = int(raw_h * scale_y)
+			else:
+				# It is in percentage, leave it as percentage
+				x = raw_x
+				y = raw_y
+				width = raw_w
+				height = raw_h
 		except (TypeError, ValueError):
 			continue
 
 		if x < 0 or y < 0 or width <= 0 or height <= 0:
 			continue
-		if x + width > original_width or y + height > original_height:
+		# Only check boundaries if coordinates are pixel values
+		if x > 1.0 and (x + width > original_width or y + height > original_height):
 			continue
 		child["position"] = {"x": x, "y": y, "width": width, "height": height}
 

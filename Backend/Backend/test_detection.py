@@ -35,7 +35,7 @@ def test_detection(image_path: Path):
     
     # Shape-based component detection (without OCR)
     print("Running shape-based component detection...")
-    shape_components = detect_shape_components(image_rgb, [])
+    shape_components = detect_shape_components(image_rgb, [], "complex")
     print(f"Found {len(shape_components)} shape components")
     
     # Print shape component details
