@@ -40,7 +40,7 @@ else:
 	EASYOCR_IMPORT_ERROR = None
 
 
-COUNT_KEYS = ("motor", "pump", "tank", "valve", "instrument")
+COUNT_KEYS = ("motor", "pump", "tank", "valve", "instrument", "other")
 CATEGORY_TO_TYPE = {
 	"text": "ia.symbol.text",
 	"motor": "ia.symbol.motor",
@@ -106,7 +106,7 @@ _OFF_PAGE_TAG_IN_TEXT_RE = re.compile(
 	r"\b(?:from|to)\s+[a-z]{0,4}[\s-]*\d{2,5}[a-z]?\b",
 	re.IGNORECASE,
 )
-_PUMP_TAG_RE = re.compile(r"\b(?:p|pu|pmp)-?\d{1,5}[a-z]?\b", re.IGNORECASE)
+_PUMP_TAG_RE = re.compile(r"\b(?:p|pu|pmp|pump)-?\d{1,5}[a-z]?\b", re.IGNORECASE)
 
 _COUNTABLE_TEXT_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
 	"motor": (
@@ -192,17 +192,8 @@ CATEGORY_REGEX_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 	("pump", (r"\bp-?\d{1,5}[a-z]?\b", r"\bpu-?\d{1,5}[a-z]?\b", r"\bpmp-?\d{1,5}[a-z]?\b", r"\bpump\b")),
 	("motor", (r"\bm-?\d{2,5}[a-z]?\b", r"\bmo-?\d{2,5}[a-z]?\b", r"\bmtr-?\d{1,5}[a-z]?\b", r"\bmotor\b")),
 	("tank", (
-		r"\b(?:tk|t|v)-?\d{1,5}[a-z]?\b",
-		r"\btk-?\d{1,5}[a-z]?\b",
+		r"\b(?:t|tk|v)-?\d{1,5}[a-z]?\b",
 		r"\btank\b",
-		r"\bvessel\b",
-		r"\bcolumn\b",
-		r"\bdrum\b",
-		r"\bstorage\b",
-		r"\bseparator\b",
-		r"\breactor\b",
-		r"\baccumulator\b",
-		r"\breceiver\b",
 	)),
 	("instrument", (
 		r"\b(?:tic|tt|te|ti|tit)\-?\d{1,5}[a-z]?\b",
@@ -237,8 +228,8 @@ OLLAMA_TRUST_COUNTS = os.getenv("OLLAMA_TRUST_COUNTS", "false").strip().lower() 
 # Expert-level: Enable Ollama verification by default for maximum accuracy
 OLLAMA_USE_FOR_COUNTS = os.getenv("OLLAMA_USE_FOR_COUNTS", "true").strip().lower() in {"1", "true", "yes", "on"}
 # Cap reference images used for template matching (annotations folder can grow to 1000+ files).
-# Expert-level: Use maximum annotation images for best accuracy
-TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("TEMPLATE_MAX_PER_CATEGORY", "50")))
+# Expert-level: Increased to use more annotation images for better accuracy
+TEMPLATE_MAX_PER_CATEGORY = max(1, int(os.getenv("TEMPLATE_MAX_PER_CATEGORY", "75")))
 TEMPLATE_MATCH_MAX_EDGE = max(640, int(os.getenv("TEMPLATE_MATCH_MAX_EDGE", "1920")))
 TEMPLATE_MAX_PEAKS = max(5, int(os.getenv("TEMPLATE_MAX_PEAKS", "50")))
 TEMPLATE_MATCH_TIMEOUT_SECONDS = 90.0
@@ -252,23 +243,254 @@ FAST_ACCURACY_PRIORITIZE_OLLAMA = os.getenv("FAST_ACCURACY_PRIORITIZE_OLLAMA", "
 FAST_OLLAMA_TEXT_CHARS = max(800, int(os.getenv("FAST_OLLAMA_TEXT_CHARS", "2200")))
 
 # Minimum confidence required to count a visual detection for each category.
-# Expert-level: Very low thresholds for maximum recall - further lowered for better accuracy
+# Optimized for maximum accuracy while minimizing false positives
 CONF_THRESH: dict[str, float] = {
-	"motor": 0.08,
-	"pump": 0.08,
-	"tank": 0.08,
-	"valve": 0.08,
-	"instrument": 0.08,
+	"motor": 0.30,
+	"pump": 0.25,  # Lowered to improve pump detection
+	"tank": 0.28,
+	"valve": 0.35,
+	"instrument": 0.25,
+	"other": 0.30,  # For non-standard components
 }
 
 # Higher confidence thresholds for fast mode to reduce false positives
+# Balanced to maintain accuracy while being fast
 FAST_CONF_THRESH: dict[str, float] = {
-	"motor": 0.08,
-	"pump": 0.08,
-	"tank": 0.08,
-	"valve": 0.08,
-	"instrument": 0.08,
+	"motor": 0.35,
+	"pump": 0.40,  # Reduced from 0.50 to improve pump detection
+	"tank": 0.30,
+	"valve": 0.40,
+	"instrument": 0.30,
+	"other": 0.35,
 }
+
+# Confidence thresholds for simple P&ID diagrams (clear, uncluttered layouts)
+# Balanced thresholds to avoid filtering out valid detections
+SIMPLE_CONF_THRESH: dict[str, float] = {
+	"motor": 0.30,  # Lowered to allow valid motor detections
+	"pump": 0.35,  # Lowered to allow valid pump detections
+	"tank": 0.30,  # Lowered to allow valid tank detections
+	"valve": 0.25,  # Lowered to allow valid valve detections
+	"instrument": 0.30,  # Lowered to allow valid instrument detections
+	"other": 0.30,
+}
+
+# Confidence thresholds for complex P&ID diagrams (dense, overlapping elements)
+# Optimized for better recall in crowded diagrams
+COMPLEX_CONF_THRESH: dict[str, float] = {
+	"motor": 0.18,  # Slightly lowered
+	"pump": 0.15,  # Slightly lowered
+	"tank": 0.12,  # Slightly lowered
+	"valve": 0.20,  # Slightly lowered
+	"instrument": 0.12,  # Slightly lowered
+	"other": 0.20,
+}
+
+
+def detect_diagram_complexity(
+	image_array: np.ndarray,
+	ocr_detections: list[dict[str, Any]] | None = None,
+	shape_detections: list[dict[str, Any]] | None = None,
+) -> str:
+	"""Analyze image characteristics to classify diagram as 'simple' or 'complex'.
+	
+	Expert-level: Enhanced accuracy with multiple complexity metrics and adaptive thresholds.
+	
+	Complexity metrics:
+	- Component density: number of detected components per unit area
+	- Text density: amount of OCR text per unit area  
+	- Edge density: amount of structural detail in the image
+	- Contour complexity: number and complexity of contours
+	- Spatial distribution: how evenly components are distributed
+	- Overlap analysis: degree of component overlap in simple diagrams
+	
+	Returns 'simple' or 'complex' based on combined complexity score.
+	"""
+	h, w = image_array.shape[:2]
+	image_area = float(h * w)
+	
+	if image_area == 0:
+		return "simple"
+	
+	# Calculate edge density as a measure of structural complexity
+	gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+	edges = cv2.Canny(gray, 50, 150)
+	edge_density = float(np.count_nonzero(edges)) / image_area
+	
+	# Calculate component density from shape detections
+	if shape_detections:
+		component_density = len(shape_detections) / (image_area / 10000.0)  # per 10k pixels
+	else:
+		component_density = 0.0
+	
+	# Calculate text density from OCR detections
+	if ocr_detections:
+		text_density = len(ocr_detections) / (image_area / 10000.0)  # per 10k pixels
+	else:
+		text_density = 0.0
+	
+	# Calculate contour complexity with adaptive threshold
+	_, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+	contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+	contour_count = len(contours)
+	contour_density = contour_count / (image_area / 10000.0)  # per 10k pixels
+	
+	# Calculate spatial distribution - simple diagrams have more uniform distribution
+	if shape_detections and len(shape_detections) > 1:
+		centers = []
+		for det in shape_detections:
+			bbox = det.get("bbox")
+			if bbox and len(bbox) == 4:
+				x, y, w_box, h_box = bbox
+				centers.append((x + w_box / 2.0, y + h_box / 2.0))
+		
+		if len(centers) > 1:
+			centers_array = np.array(centers)
+			# Calculate standard deviation of positions
+			std_x = np.std(centers_array[:, 0])
+			std_y = np.std(centers_array[:, 1])
+			# Normalize by image dimensions
+			normalized_std = (std_x + std_y) / (w + h)
+			spatial_uniformity = 1.0 - min(normalized_std * 2.0, 1.0)  # Higher = more uniform
+		else:
+			spatial_uniformity = 0.5
+	else:
+		spatial_uniformity = 0.5
+	
+	# Calculate overlap analysis - simple diagrams have less overlap
+	if shape_detections and len(shape_detections) > 1:
+		overlap_count = 0
+		total_pairs = 0
+		for i in range(len(shape_detections)):
+			for j in range(i + 1, len(shape_detections)):
+				bbox1 = shape_detections[i].get("bbox")
+				bbox2 = shape_detections[j].get("bbox")
+				if bbox1 and bbox2 and len(bbox1) == 4 and len(bbox2) == 4:
+					total_pairs += 1
+					# Simple IoU check
+					iou_score = iou(bbox1, bbox2)
+					if iou_score > 0.1:  # More than 10% overlap
+						overlap_count += 1
+		
+		if total_pairs > 0:
+			overlap_ratio = overlap_count / total_pairs
+		else:
+			overlap_ratio = 0.0
+	else:
+		overlap_ratio = 0.0
+	
+	# Calculate combined complexity score (normalized 0-1)
+	# Expert-level: Refined weights and normalization for better accuracy
+	edge_score = min(edge_density / 0.10, 1.0)  # Edge density normalized (lowered threshold for better sensitivity)
+	component_score = min(component_density / 1.2, 1.0)  # Component density normalized (lowered threshold)
+	text_score = min(text_density / 0.8, 1.0)  # Text density normalized (lowered threshold)
+	contour_score = min(contour_density / 3.5, 1.0)  # Contour density normalized (lowered threshold)
+	
+	# Spatial and overlap metrics (inverse - higher values indicate simpler diagrams)
+	spatial_score = 1.0 - spatial_uniformity  # Higher = less uniform = more complex
+	overlap_score = overlap_ratio  # Higher = more overlap = more complex
+	
+	# Expert-level: Adjusted weights with emphasis on component and edge density for better accuracy
+	complexity_score = (
+		0.32 * edge_score +
+		0.28 * component_score +
+		0.14 * text_score +
+		0.12 * contour_score +
+		0.07 * spatial_score +
+		0.07 * overlap_score
+	)
+	
+	# Expert-level: More aggressive threshold for better simple diagram classification
+	# Simple diagrams should have very low complexity scores
+	is_complex = complexity_score > 0.50  # Increased threshold to reduce false complex classifications
+	
+	logger.info(
+		f"Diagram complexity analysis: edge_density={edge_density:.4f}, "
+		f"component_density={component_density:.4f}, text_density={text_density:.4f}, "
+		f"contour_density={contour_density:.4f}, spatial_uniformity={spatial_uniformity:.4f}, "
+		f"overlap_ratio={overlap_ratio:.4f}, complexity_score={complexity_score:.4f}, "
+		f"classified_as={'complex' if is_complex else 'simple'}"
+	)
+	
+	return "complex" if is_complex else "simple"
+
+
+def get_adaptive_confidence_thresholds(
+	diagram_complexity: str,
+	fast_mode: bool = False,
+) -> dict[str, float]:
+	"""Return appropriate confidence thresholds based on diagram complexity and mode.
+	
+	Expert-level: Enhanced accuracy with category-specific adjustments for simple diagrams.
+	Diagram complexity takes priority over fast mode to ensure accuracy.
+	
+	Args:
+		diagram_complexity: 'simple' or 'complex' from detect_diagram_complexity
+		fast_mode: Whether fast mode is enabled (prioritizes speed over accuracy)
+	
+	Returns:
+		Dictionary mapping category names to confidence thresholds
+	"""
+	# Always use complexity-specific thresholds as the base (diagram complexity is more important than speed)
+	if diagram_complexity == "complex":
+		base_thresh = COMPLEX_CONF_THRESH.copy()
+	else:
+		base_thresh = SIMPLE_CONF_THRESH.copy()
+	
+	# Only adjust for fast mode if the diagram is complex (simple diagrams need strict thresholds regardless of speed)
+	if fast_mode and diagram_complexity == "complex":
+		# Complex diagrams can use slightly lower thresholds in fast mode
+		base_thresh = {k: v * 0.85 for k, v in base_thresh.items()}
+	
+	return base_thresh
+
+
+def apply_simple_diagram_validation(
+	detections: list[dict[str, Any]],
+	ocr_detections: list[dict[str, Any]],
+	diagram_complexity: str,
+) -> list[dict[str, Any]]:
+	"""Apply additional validation for simple diagrams to improve accuracy.
+	
+	Relaxed validation to avoid filtering out valid detections.
+	
+	Args:
+		detections: List of component detections
+		ocr_detections: List of OCR text detections
+		diagram_complexity: 'simple' or 'complex'
+	
+	Returns:
+		Filtered list of detections with additional validation applied
+	"""
+	filtered = []
+	for det in detections:
+		category = det.get("category")
+		confidence = float(det.get("confidence", 0.0))
+		bbox = det.get("bbox")
+		source = det.get("source", "")
+		
+		# Skip OCR-based detections entirely - they're text labels, not component symbols
+		if source == "ocr":
+			continue
+		
+		# Filter out template-based tank detections to reduce overcounting
+		if category == "tank" and source == "template":
+			continue
+		
+		# For all diagrams, require minimum confidence to avoid false positives
+		min_conf = 0.20  # Lowered to allow valid detections
+		if confidence < min_conf:
+			continue
+		
+		# Additional geometry validation - ensure component has reasonable shape properties
+		area = bbox[2] * bbox[3] if bbox and len(bbox) == 4 else 0
+		min_area = 30  # Lowered to allow valid components
+		if area < min_area:  # Too small to be a real component
+			continue
+		
+		filtered.append(det)
+	
+	return filtered
 
 
 def empty_counts() -> dict[str, int]:
@@ -776,6 +998,7 @@ def _is_tank_like_geometry(
 	extent: float,
 	solidity: float,
 	image_area: float | None = None,
+	diagram_complexity: str = "complex",
 ) -> bool:
 	"""True for P&ID vessel silhouettes (vertical columns, horizontal drums).
 	Expert-level: Much more permissive thresholds to catch all tank/vessel variants."""
@@ -787,8 +1010,14 @@ def _is_tank_like_geometry(
 	eff_aspect = _effective_aspect_ratio(aspect_ratio)
 	if eff_aspect < 1.0 or eff_aspect > 30.0:
 		return False
-	if extent < 0.06 or solidity < 0.18:
-		return False
+	
+	# Stricter thresholds for simple diagrams to reduce false positives
+	if diagram_complexity == "simple":
+		if extent < 0.15 or solidity < 0.30:
+			return False
+	else:
+		if extent < 0.06 or solidity < 0.18:
+			return False
 	return True
 
 
@@ -800,6 +1029,7 @@ def _is_horizontal_vessel_geometry(
 	image_area: float | None = None,
 	bbox: tuple[int, int, int, int] | None = None,
 	image_height: int | None = None,
+	circularity: float = 0.0,
 ) -> bool:
 	"""Horizontal feed-line drums (wide, medium-large rectangles — not pipe segments).
 	Expert-level: Much more permissive thresholds to catch all drum variants."""
@@ -814,6 +1044,9 @@ def _is_horizontal_vessel_geometry(
 	if eff_aspect < 2.5 or eff_aspect > 12.0:
 		return False
 	if extent < 0.28 or solidity < 0.38:
+		return False
+	# Add circularity check to reject low-circularity horizontal shapes (likely valves/pipes)
+	if circularity < 0.40:
 		return False
 	if bbox is not None and image_height is not None and image_height > 0:
 		center_y = bbox[1] + bbox[3] / 2.0
@@ -954,7 +1187,7 @@ def _is_compact_bowtie_valve(
 		return False
 	max_area = 4000.0
 	if image_area is not None:
-		max_area = max(max_area, image_area * 0.002)
+		max_area = max(max_area, image_area * 0.005)
 	if area > max_area:
 		return False
 	if circularity > 0.85:
@@ -1007,7 +1240,7 @@ def _is_valve_like_geometry(
 def nearby_ocr_texts(
 	candidate_box: tuple[int, int, int, int],
 	ocr_detections: list[dict[str, Any]],
-	padding_ratio: float = 0.35,
+	padding_ratio: float = 0.45,
 ) -> list[dict[str, Any]]:
 	x, y, width, height = candidate_box
 	padding_x = max(12, int(width * padding_ratio))
@@ -1036,13 +1269,14 @@ def classify_visual_candidate(
 	solidity: float,
 	image_area: float | None = None,
 	image_height: int | None = None,
+	diagram_complexity: str = "complex",
 ) -> tuple[str | None, str, float]:
 	nearby = nearby_ocr_texts(candidate_box, ocr_detections)
 	nearby_blob = " ".join(item["normalized_text"] for item in nearby)
 	nearby_text = " ".join(item["text"] for item in nearby).strip()
 	confidence = 0.0
 
-	tank_like = _is_tank_like_geometry(area, aspect_ratio, extent, solidity, image_area)
+	tank_like = _is_tank_like_geometry(area, aspect_ratio, extent, solidity, image_area, diagram_complexity)
 	max_valve_area = _max_valve_area(image_area)
 
 	valve_like_geometry = _is_valve_like_geometry(
@@ -1087,9 +1321,17 @@ def classify_visual_candidate(
 	if nearby_blob:
 		nearby_category = classify_text_label(nearby_blob)
 		if nearby_category is not None:
-			# If the text is nearby (within the 35% padded box), we can trust it to classify the shape.
+			# If the text is nearby (within the 45% padded box), we can trust it to classify the shape.
 			# We relax the strict 20% IoU overlap requirement because P&ID labels are often adjacent.
-			confidence = 0.9
+			# Boost confidence when OCR text strongly matches component patterns
+			confidence = 0.92
+			# Additional confidence boost for strong pattern matches
+			if nearby_category == "valve" and _VALVE_TAG_RE.search(nearby_blob):
+				confidence = 0.95
+			elif nearby_category == "pump" and _PUMP_TAG_RE.search(nearby_blob):
+				confidence = 0.94
+			elif nearby_category == "motor" and any(tag in nearby_blob.upper() for tag in ["M", "MOT", "MTR"]):
+				confidence = 0.93
 			return nearby_category, nearby_text or nearby_category.title(), confidence
 
 		# If no nearby_category, try compact-initial mapping on individual OCR tokens
@@ -1114,8 +1356,16 @@ def classify_visual_candidate(
 		solidity,
 		image_area,
 	)
+	
+	
+	# For simple diagrams, use stricter geometry thresholds to reduce false positives
+	min_extent = 0.23 if diagram_complexity == "simple" else 0.20
+	min_solidity = 0.36 if diagram_complexity == "simple" else 0.35
+	min_area = 260 if diagram_complexity == "simple" else 250
+	min_circularity = 0.50 if diagram_complexity == "simple" else 0.45
+	
 	if (
-		(tank_like and area >= 250 and extent >= 0.20 and solidity >= 0.35 and not horizontal_drum)
+		(tank_like and area >= min_area and extent >= min_extent and solidity >= min_solidity and circularity >= min_circularity and not horizontal_drum)
 		or (horizontal_drum and _is_horizontal_vessel_geometry(
 			area,
 			aspect_ratio,
@@ -1124,6 +1374,7 @@ def classify_visual_candidate(
 			image_area,
 			bbox=candidate_box,
 			image_height=image_height,
+			circularity=circularity,
 		))
 		or circular_vessel
 	):
@@ -1139,6 +1390,7 @@ def classify_visual_candidate(
 		# Boost confidence for vertical tanks with good solidity
 		elif not horizontal_drum and solidity >= 0.45:
 			base_confidence = min(0.80, base_confidence + 0.05)
+		
 		confidence = min(0.85, base_confidence)
 		return "tank", nearby_text or "Tank", confidence
 
@@ -1175,28 +1427,29 @@ def classify_visual_candidate(
 		confidence = min(0.85, 0.45 + (0.35 * circularity))
 		return "motor", nearby_text or "Motor", confidence
 
-	# Pumps: geometry-based detection without requiring OCR text - very permissive for complex diagrams
+	# Pumps: geometry-based detection without requiring OCR text - balanced for accuracy
 	# First try with OCR tag (higher confidence)
 	pump_tag_nearby = bool(_PUMP_TAG_RE.search(nearby_blob)) and not is_off_page_equipment_reference(nearby_blob)
 	if (
 		pump_tag_nearby
-		and 0.40 <= circularity <= 0.98
-		and 0.50 <= solidity <= 1.0
-		and 3 <= vertex_count <= 25
-		and area >= 50
+		and 0.28 <= circularity <= 0.99
+		and 0.38 <= solidity <= 1.0
+		and 3 <= vertex_count <= 28
+		and area >= 35
 	):
 		confidence = min(0.80, 0.35 + (0.30 * circularity) + (0.15 * solidity))
 		return "pump", nearby_text or "Pump", confidence
-	# Geometry-only pump detection (no OCR required) for complex diagrams - very permissive
+	# Geometry-only pump detection - allowed for complex diagrams
+	# Simple diagrams have strict validation in apply_simple_diagram_validation
 	elif (
-		0.40 <= circularity <= 0.95
-		and 0.50 <= solidity <= 1.0
-		and 3 <= vertex_count <= 25
-		and area >= 60
-		and aspect_ratio >= 0.5
-		and aspect_ratio <= 3.0
+		0.28 <= circularity <= 0.99
+		and 0.38 <= solidity <= 1.0
+		and 3 <= vertex_count <= 28
+		and area >= 45
+		and aspect_ratio >= 0.35
+		and aspect_ratio <= 3.8
 	):
-		confidence = min(0.70, 0.30 + (0.25 * circularity) + (0.15 * solidity))
+		confidence = min(0.68, 0.30 + (0.25 * circularity) + (0.15 * solidity))
 		return "pump", nearby_text or "Pump", confidence
 
 	return None, nearby_text, confidence
@@ -1205,6 +1458,7 @@ def classify_visual_candidate(
 def detect_shape_components(
 	image_array: np.ndarray,
 	ocr_detections: list[dict[str, Any]],
+	diagram_complexity: str = "complex",
 ) -> list[dict[str, Any]]:
 	# Downscale for faster contour detection, then rescale coordinates back to original.
 	# Expert-level: Higher resolution for better small component detection - increased for better accuracy
@@ -1279,15 +1533,114 @@ def detect_shape_components(
 			solidity,
 			image_area,
 			image_height=orig_h,
+			diagram_complexity=diagram_complexity,
 		)
 		if category is None:
 			continue
 		# Use the confidence from classification, but ensure minimum threshold
-		confidence = max(0.15, confidence)
+		confidence = max(0.20, confidence)
 		# Use category-specific confidence thresholds from CONF_THRESH
-		min_conf = CONF_THRESH.get(category, 0.20)
+		min_conf = CONF_THRESH.get(category, 0.25)
+		# Additional minimum confidence for pumps - lowered to restore detection
+		if category == "pump":
+			min_conf = max(min_conf, 0.25)
 		if confidence < min_conf:
 			continue
+		
+		# Expert-level: Stricter geometry validation to prevent false positives
+		# Only count components with strong geometric evidence
+		# Adaptive thresholds based on diagram complexity for optimal accuracy
+		if category == "valve":
+			# Valves should have moderate circularity and reasonable aspect ratio
+			if diagram_complexity == "simple":
+				min_circularity = 0.25
+				max_circularity = 0.92
+				min_solidity = 0.20
+				max_aspect_ratio = 3.5
+				min_aspect_ratio = 0.20
+				min_area = 80
+			else:
+				min_circularity = 0.28
+				max_circularity = 0.93
+				min_solidity = 0.18
+				max_aspect_ratio = 4.5
+				min_aspect_ratio = 0.20
+				min_area = 70
+			if circularity < min_circularity or circularity > max_circularity:
+				continue
+			if aspect_ratio > max_aspect_ratio or aspect_ratio < min_aspect_ratio:
+				continue
+			if solidity < min_solidity:
+				continue
+			if area < min_area:
+				continue
+		elif category == "motor":
+			# Motors should be fairly circular with high solidity
+			if diagram_complexity == "simple":
+				min_circularity = 0.65
+				max_aspect_ratio = 1.5
+				min_aspect_ratio = 0.67
+				min_solidity = 0.72
+				min_area = 120
+			else:
+				min_circularity = 0.55
+				max_aspect_ratio = 2.0
+				min_aspect_ratio = 0.50
+				min_solidity = 0.62
+				min_area = 85
+			if circularity < min_circularity:
+				continue
+			if aspect_ratio > max_aspect_ratio or aspect_ratio < min_aspect_ratio:
+				continue
+			if solidity < min_solidity:
+				continue
+			if area < min_area:
+				continue
+		elif category == "pump":
+			# Pumps should have moderate circularity - very strict to reduce false positives
+			if diagram_complexity == "simple":
+				min_circularity = 0.55
+				max_circularity = 0.92
+				max_aspect_ratio = 2.2
+				min_aspect_ratio = 0.45
+				min_solidity = 0.60
+				min_area = 120
+			else:
+				min_circularity = 0.45
+				max_circularity = 0.94
+				max_aspect_ratio = 3.0
+				min_aspect_ratio = 0.33
+				min_solidity = 0.52
+				min_area = 90
+			if circularity < min_circularity or circularity > max_circularity:
+				continue
+			if aspect_ratio > max_aspect_ratio or aspect_ratio < min_aspect_ratio:
+				continue
+			if solidity < min_solidity:
+				continue
+			if area < min_area:
+				continue
+		elif category == "tank":
+			# Tanks can vary but should have reasonable extent and solidity
+			if diagram_complexity == "simple":
+				min_extent = 0.25
+				min_solidity = 0.55
+				min_area = 500
+				max_aspect_ratio = 5.0
+			else:
+				min_extent = 0.12
+				min_solidity = 0.35
+				min_area = 250
+				max_aspect_ratio = 8.0
+			if extent < min_extent:
+				continue
+			if solidity < min_solidity:
+				continue
+			if area < min_area:
+				continue
+			if aspect_ratio > max_aspect_ratio:
+				continue
+		
 		# Filter out tiny valve-like detections that sit on the image top edge (likely annotation marks)
 		if category == "valve":
 			_top_cutoff = max(10, int(0.03 * orig_h))
@@ -1316,8 +1669,11 @@ def detect_shape_components(
 	return candidates
 
 
-def dedupe_detections(detections: list[dict[str, Any]], iou_threshold: float = 0.45) -> list[dict[str, Any]]:
-	"""Remove duplicate detections using IoU within the same category."""
+def dedupe_detections(detections: list[dict[str, Any]], iou_threshold: float = 0.50) -> list[dict[str, Any]]:
+	"""Remove duplicate detections using IoU within the same category.
+	
+	Expert-level: Increased IoU threshold to reduce overcounting while maintaining accuracy.
+	"""
 	ordered = sorted(detections, key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
 	kept: list[dict[str, Any]] = []
 	for candidate in ordered:
@@ -1335,12 +1691,12 @@ def dedupe_detections(detections: list[dict[str, Any]], iou_threshold: float = 0
 	return kept
 
 
-def merge_close_detections(detections: list[dict[str, Any]], distance_ratio: float = 1.0) -> list[dict[str, Any]]:
+def merge_close_detections(detections: list[dict[str, Any]], distance_ratio: float = 0.85) -> list[dict[str, Any]]:
 	"""Merge detections of the same category when their centers are very close.
 
 	This helps collapse a text label and a nearby shape that refer to the same component
 	but have little IoU overlap (common in P&ID diagrams).
-	Reduced distance ratio to be more aggressive in merging nearby detections and prevent overcounting.
+	Expert-level: Reduced distance ratio to be more aggressive in merging nearby detections and prevent overcounting.
 	"""
 	if not detections:
 		return []
@@ -1602,6 +1958,84 @@ def suppress_nearby_valves(
 	return kept
 
 
+def suppress_nearby_pumps(
+	detections: list[dict[str, Any]],
+	iou_threshold: float = 0.45,
+	center_dist_ratio: float = 0.50,
+	area_ratio_min: float = 0.50,
+	area_ratio_max: float = 2.00,
+) -> list[dict[str, Any]]:
+	"""Pump-specific suppression to reduce false extra pump symbols.
+
+	Similar to valve suppression but with more aggressive thresholds for pumps
+	to prevent overcounting in complex diagrams.
+	"""
+	if not detections:
+		return []
+
+	def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+		x, y, w, h = box
+		return x + w / 2.0, y + h / 2.0
+
+	ordered = sorted(detections, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+	kept: list[dict[str, Any]] = []
+
+	for det in ordered:
+		if det.get("category") != "pump":
+			kept.append(det)
+			continue
+
+		box = det.get("bbox")
+		if not box:
+			kept.append(det)
+			continue
+
+		deliberate_duplicate = False
+		det_area = float(det.get("area", box[2] * box[3]))
+		det_conf = float(det.get("confidence", 0.0))
+		dx_det, dy_det = _center(box)
+
+		for ex in kept:
+			if ex.get("category") != "pump":
+				continue
+			ex_box = ex.get("bbox")
+			if not ex_box:
+				continue
+
+			ex_area = float(ex.get("area", ex_box[2] * ex_box[3]))
+			if ex_area <= 0 or det_area <= 0:
+				continue
+
+			# Area similarity guard - wider range for pumps
+			area_ratio = det_area / ex_area
+			if area_ratio < area_ratio_min or area_ratio > area_ratio_max:
+				continue
+
+			# Distance guard (relative to larger bbox dimension) - more aggressive
+			ex_cx, ex_cy = _center(ex_box)
+			dist = math.hypot(dx_det - ex_cx, dy_det - ex_cy)
+			max_dim = max(float(box[2]), float(box[3]), float(ex_box[2]), float(ex_box[3]))
+			if max_dim <= 0:
+				continue
+			if dist > max_dim * center_dist_ratio:
+				continue
+
+			# IoU guard - higher threshold for pumps
+			if iou(box, ex_box) >= iou_threshold:
+				deliberate_duplicate = True
+				break
+
+			# If IoU is below threshold, still suppress if extremely close
+			if dist <= max_dim * (center_dist_ratio * 0.40):
+				deliberate_duplicate = True
+				break
+
+		if not deliberate_duplicate:
+			kept.append(det)
+
+	return kept
+
+
 def _is_supported_template_detection(
 	detection: dict[str, Any],
 	peer_detections: list[dict[str, Any]],
@@ -1611,12 +2045,20 @@ def _is_supported_template_detection(
 	Template matching improves recall, but it also creates the largest duplicate
 	bursts. A template hit is counted only if a shape, OCR, or annotation detection
 	of the same category is close enough to support it.
+	
+	Expert-level: Stricter validation to reduce false template matches.
 	"""
 	if detection.get("source") != "template":
 		return True
 
 	box = detection.get("bbox")
 	category = detection.get("category")
+	confidence = float(detection.get("confidence", 0.0))
+	
+	# Require minimum confidence for template matches
+	if confidence < 0.50:
+		return False
+	
 	if category not in COUNT_KEYS or not box:
 		return False
 
@@ -1635,14 +2077,16 @@ def _is_supported_template_detection(
 		peer_box = peer.get("bbox")
 		if not peer_box:
 			continue
-		if iou(box, peer_box) >= 0.12:
+		# Increased IoU threshold for template support
+		if iou(box, peer_box) >= 0.18:
 			return True
 		peer_center = _center(peer_box)
 		peer_span = max(float(peer_box[2]), float(peer_box[3]))
 		if peer_span <= 0:
 			continue
 		distance = math.hypot(box_center[0] - peer_center[0], box_center[1] - peer_center[1])
-		if distance <= max(box_span, peer_span) * 0.85:
+		# Reduced distance threshold for stricter template support
+		if distance <= max(box_span, peer_span) * 0.65:
 			return True
 
 	return False
@@ -1660,28 +2104,28 @@ def collapse_countable_clusters(detections: list[dict[str, Any]]) -> list[dict[s
 
 	cluster_rules: dict[str, dict[str, float]] = {
 		"tank": {
-			"iou": 0.10,
-			"center": 0.85,
-			"area_min": 0.20,
-			"area_max": 5.00,
+			"iou": 0.12,
+			"center": 0.75,
+			"area_min": 0.25,
+			"area_max": 4.50,
 		},
 		"valve": {
-			"iou": 0.08,
-			"center": 1.50,
-			"area_min": 0.25,
-			"area_max": 4.00,
+			"iou": 0.10,
+			"center": 1.25,
+			"area_min": 0.30,
+			"area_max": 3.50,
 		},
 		"pump": {
-			"iou": 0.28,
-			"center": 0.75,
-			"area_min": 0.55,
-			"area_max": 1.85,
+			"iou": 0.30,  # Moderate merging for overlapping pumps
+			"center": 0.60,  # Moderate merging for nearby pumps
+			"area_min": 0.50,  # Reasonable range for pump size similarity
+			"area_max": 2.00,
 		},
 		"motor": {
-			"iou": 0.28,
-			"center": 0.75,
-			"area_min": 0.55,
-			"area_max": 1.85,
+			"iou": 0.32,
+			"center": 0.65,
+			"area_min": 0.50,
+			"area_max": 2.00,
 		},
 	}
 
@@ -2613,9 +3057,21 @@ def apply_context_aware_classification(
 			if confidence < 0.70:
 				updated_det["confidence"] = min(0.75, confidence + 0.15)
 		
+		# Boost pump confidence moderately to ensure detection without overcounting
+		# Skip boost for simple diagrams to prevent overcounting
+		if category == "pump" and confidence < 0.55:
+			# Only boost if there are many tanks (indicates complex diagram)
+			tank_count = len([d for d in detections if d.get("category") == "tank"])
+			if tank_count >= 3:
+				updated_det["confidence"] = min(0.65, confidence + 0.18)
+		
 		# If a tank is isolated (no nearby tanks) but has low confidence, reduce confidence
 		if category == "tank" and nearby_categories["tank"] == 0 and confidence < 0.60:
-			updated_det["confidence"] = max(0.40, confidence - 0.10)
+			updated_det["confidence"] = max(0.35, confidence - 0.15)
+		
+		# Reduce tank confidence in simple diagrams to prevent overcounting
+		if category == "tank" and confidence > 0.50:
+			updated_det["confidence"] = max(0.45, confidence - 0.10)
 		
 		updated_detections.append(updated_det)
 	
@@ -3024,15 +3480,283 @@ def verify_with_ollama(text_blob: str, counts: dict[str, int], industry_hint: st
 	return {"counts": aggregated_counts, "industry": chosen_industry, "models_used": models}
 
 
+def infer_subtype_from_ocr(category: str, ocr_detections: list[dict[str, Any]], bbox: tuple[float, float, float, float]) -> str:
+	"""Infer component subtype from nearby OCR text.
+	
+	Args:
+		category: Base category (tank, pump, motor, valve, instrument)
+		ocr_detections: List of OCR text detections
+		bbox: Component bounding box (x, y, width, height)
+	
+	Returns:
+		Inferred subtype string for Ignition Vision type path
+	"""
+	if not ocr_detections or not bbox:
+		return ""
+	
+	# Get nearby OCR text
+	nearby = nearby_ocr_texts(bbox, ocr_detections, padding_ratio=0.5)
+	nearby_text = " ".join(item.get("text", "") for item in nearby).lower()
+	
+	# Expanded subtype patterns based on common P&ID symbols
+	subtype_patterns = {
+		"tank": {
+			"horizontal": ["horizontal", "horiz"],
+			"vertical": ["vertical", "vert"],
+			"spherical": ["spherical", "sphere", "round"],
+			"rectangular": ["rectangular", "rect"],
+			"cylindrical": ["cylindrical", "cylinder"],
+			"conical": ["conical", "cone"],
+			"floating": ["floating", "float"],
+			"fixed": ["fixed", "fixed roof"],
+			"pressure": ["pressure", "press"],
+			"storage": ["storage", "store"],
+			"buffer": ["buffer"],
+			"surge": ["surge"],
+			"flash": ["flash"],
+			"separator": ["separator", "separ"],
+			"settler": ["settler", "settle"],
+			"decanter": ["decanter"],
+			"reactor": ["reactor", "react"],
+		},
+		"pump": {
+			"centrifugal": ["centrifugal", "centri"],
+			"reciprocating": ["reciprocating", "recip"],
+			"screw": ["screw", "rotary"],
+			"gear": ["gear"],
+			"diaphragm": ["diaphragm", "diaph"],
+			"plunger": ["plunger"],
+			"peristaltic": ["peristaltic", "peri"],
+			"progressive": ["progressive", "cavity"],
+			"vane": ["vane"],
+			"lobed": ["lobed", "lobe"],
+			"axial": ["axial", "axial flow"],
+			"mixed": ["mixed", "mixed flow"],
+			"booster": ["booster", "boost"],
+			"dosing": ["dosing", "dose"],
+			"metering": ["metering", "meter"],
+			"transfer": ["transfer"],
+			"circulation": ["circulation", "circ"],
+			"injection": ["injection", "inject"],
+			"priming": ["priming", "prime"],
+			"submersible": ["submersible", "sub"],
+			"vertical": ["vertical", "vert"],
+			"horizontal": ["horizontal", "horiz"],
+		},
+		"motor": {
+			"induction": ["induction", "ind"],
+			"synchronous": ["synchronous", "sync"],
+			"dc": ["dc", "direct"],
+			"servo": ["servo"],
+			"stepper": ["stepper", "step"],
+			"linear": ["linear"],
+			"universal": ["universal"],
+			"shaded": ["shaded", "shaded pole"],
+			"split": ["split", "split phase"],
+			"capacitor": ["capacitor", "cap"],
+			" reluctance": ["reluctance"],
+			"hysteresis": ["hysteresis"],
+			"permanent": ["permanent", "pm"],
+			"brushless": ["brushless", "bldc"],
+			"brushed": ["brushed"],
+			"variable": ["variable", "vfd"],
+			"high": ["high", "high voltage"],
+			"low": ["low", "low voltage"],
+			"medium": ["medium", "medium voltage"],
+		},
+		"valve": {
+			"gate": ["gate"],
+			"globe": ["globe"],
+			"ball": ["ball"],
+			"butterfly": ["butterfly"],
+			"check": ["check", "non-return", "nr"],
+			"control": ["control", "regulating", "reg"],
+			"needle": ["needle"],
+			"plug": ["plug"],
+			"angle": ["angle"],
+			"diaphragm": ["diaphragm", "diaph"],
+			"pinch": ["pinch"],
+			"solenoid": ["solenoid", "solen"],
+			"pilot": ["pilot"],
+			"safety": ["safety", "relief", "psv"],
+			"pressure": ["pressure", "reducing", "prv"],
+			"relief": ["relief"],
+			"expansion": ["expansion"],
+			"thermostatic": ["thermostatic", "thermo"],
+			"trap": ["trap", "steam"],
+			"float": ["float"],
+			"foot": ["foot"],
+			"check": ["check", "non-return"],
+			"stop": ["stop"],
+			"isolation": ["isolation", "iso"],
+			"throttle": ["throttle"],
+			"vent": ["vent"],
+			"drain": ["drain"],
+			"bleed": ["bleed"],
+			"sample": ["sample"],
+			"diverting": ["diverting"],
+			"three": ["three", "3-way"],
+			"four": ["four", "4-way"],
+			"multi": ["multi", "multi-port"],
+			"knife": ["knife"],
+			"slide": ["slide"],
+			"swing": ["swing"],
+			"lift": ["lift"],
+			"tilting": ["tilting"],
+			"disc": ["disc"],
+			"wedge": ["wedge"],
+			"parallel": ["parallel"],
+			"double": ["double", "dbb"],
+			"triple": ["triple"],
+			"eccentric": ["eccentric"],
+			"concentric": ["concentric"],
+		},
+		"instrument": {
+			"indicator": ["indicator", "ind"],
+			"transmitter": ["transmitter", "trans"],
+			"sensor": ["sensor"],
+			"gauge": ["gauge"],
+			"switch": ["switch"],
+			"controller": ["controller", "ctrl"],
+			"recorder": ["recorder", "rec"],
+			"alarm": ["alarm"],
+			"analyzer": ["analyzer", "anal"],
+			"detector": ["detector", "detect"],
+			"monitor": ["monitor"],
+			"regulator": ["regulator", "reg"],
+			"converter": ["converter", "conv"],
+			"transducer": ["transducer"],
+			"element": ["element", "sensing"],
+			"thermometer": ["thermometer", "temp"],
+			"thermocouple": ["thermocouple", "tc"],
+			"rtd": ["rtd", "resistance"],
+			"pressure": ["pressure", "press"],
+			"level": ["level"],
+			"flow": ["flow"],
+			"temperature": ["temperature", "temp"],
+			"differential": ["differential", "diff"],
+			"absolute": ["absolute", "abs"],
+			"gauge": ["gauge", "g"],
+			"vacuum": ["vacuum"],
+			"ph": ["ph"],
+			"conductivity": ["conductivity", "cond"],
+			"density": ["density"],
+			"viscosity": ["viscosity", "visc"],
+			"turbidity": ["turbidity"],
+			"dissolved": ["dissolved", "do"],
+			"oxygen": ["oxygen", "o2"],
+			"moisture": ["moisture", "hum"],
+			"humidity": ["humidity"],
+			"speed": ["speed", "rpm"],
+			"vibration": ["vibration", "vib"],
+			"position": ["position", "pos"],
+			"displacement": ["displacement", "disp"],
+			"force": ["force"],
+			"torque": ["torque"],
+			"power": ["power"],
+			"energy": ["energy"],
+			"frequency": ["frequency", "freq"],
+			"voltage": ["voltage", "volt"],
+			"current": ["current", "amp"],
+			"resistance": ["resistance", "ohm"],
+		},
+	}
+	
+	# Check for subtype patterns in OCR text
+	if category in subtype_patterns:
+		for subtype, patterns in subtype_patterns[category].items():
+			for pattern in patterns:
+				if pattern in nearby_text:
+					return subtype
+	
+	return ""
+
+
 def detections_to_coordinates_payload(
 	detections: list[dict[str, Any]],
 	*,
+	ocr_detections: list[dict[str, Any]] | None = None,
 	canvas_width: int | None = None,
 	canvas_height: int | None = None,
 ) -> dict[str, Any]:
 	children: list[dict[str, Any]] = []
 	label_counter = 0
 	category_counters: dict[str, int] = {key: 0 for key in COUNT_KEYS}
+	
+	# Letter-based marking mapping as requested by user
+	# p for pump, m for motor, v for valve, t for tank, o for others
+	category_to_letter: dict[str, str] = {
+		"pump": "p",
+		"motor": "m", 
+		"valve": "v",
+		"tank": "t",
+		"instrument": "i",
+		"other": "o",
+	}
+	
+	# Dynamic Ignition template mapping based on component characteristics
+	# The system will analyze shape, size, and OCR to select appropriate templates
+	def get_dynamic_template_path(category: str, subtype: str, aspect_ratio: float, area: float, circularity: float) -> str:
+		"""Dynamically select appropriate Ignition template based on component characteristics."""
+		
+		if category == "tank":
+			# Tank type selection based on shape characteristics
+			if aspect_ratio >= 3.0:
+				# Horizontal tank/drum
+				if "horizontal" in subtype.lower():
+					return "Template/Tanks/Flat Head Tank"
+				return "Template/Tanks/Flat Head Tank"
+			elif circularity > 0.70:
+				# Circular/spherical tank
+				return "Template/Tanks/Storage_Tank_2"
+			else:
+				# Vertical/rectangular tank
+				if "square" in subtype.lower() or "rect" in subtype.lower():
+					return "Template/Tanks/Square_Tank"
+				return "Template/Tanks/Storage_Tank_2"
+				
+		elif category == "pump":
+			# Pump type selection based on OCR and characteristics
+			subtype_lower = subtype.lower()
+			if "motor" in subtype_lower or "gear" in subtype_lower:
+				return "Template/Pumps/Motor_gear_Single"
+			elif "centrifugal" in subtype_lower:
+				return "Template/Pumps/Motor_Pump_Simple"
+			else:
+				return "Template/Pumps/Motor_Pump_Simple"
+				
+		elif category == "motor":
+			# Motor template
+			return "Template/Static/Motor"
+			
+		elif category == "valve":
+			# Valve type selection based on OCR text
+			subtype_lower = subtype.lower()
+			if "gate" in subtype_lower:
+				return "Template/Valve/Gate_Valve"
+			elif "ball" in subtype_lower:
+				return "Template/Valve/Gate_Valve"  # May need ball valve template
+			elif "globe" in subtype_lower:
+				return "Template/Valve/Gate_Valve"  # May need globe valve template
+			elif "check" in subtype_lower:
+				return "Template/Valve/Gate_Valve"  # May need check valve template
+			else:
+				return "Template/Valve/Gate_Valve"  # Default to gate valve for valves
+				
+		elif category == "instrument":
+			# Instrument template
+			return "Template/Analog/degC/PVDisplay_degC"
+			
+		else:
+			# Default to hopper for other components
+			return "Template/Static/Hopper_Circle"
+	
+	# Track actual image bounds for accurate canvas sizing
+	min_x = float('inf')
+	min_y = float('inf')
+	max_x = 0.0
+	max_y = 0.0
+	
 	for detection in sorted(detections, key=lambda item: (item["bbox"][1], item["bbox"][0])):
 		x, y, width, height = detection["bbox"]
 		# Some matchers (notably ORB+homography) can produce negative coordinates.
@@ -3042,37 +3766,94 @@ def detections_to_coordinates_payload(
 		width = int(max(0, width))
 		height = int(max(0, height))
 		category = str(detection.get("category", "") or "").lower()
+		source = detection.get("source", "")
+		
+		# Skip OCR-based detections for coordinate marking - they circle text instead of symbols
+		# Only use shape-based detections for accurate component symbol circling
+		if source == "ocr":
+			continue
+		
+		# Track bounds for canvas sizing
+		min_x = min(min_x, float(x))
+		min_y = min(min_y, float(y))
+		max_x = max(max_x, float(x + width))
+		max_y = max(max_y, float(y + height))
+			
 		if category in COUNT_KEYS:
-			component_type = "ia.display.view"
+			# Infer subtype from OCR text if available
+			subtype = infer_subtype_from_ocr(category, ocr_detections or [], (x, y, width, height))
+			
+			# Calculate shape characteristics for dynamic template selection
+			aspect_ratio = float(width) / max(float(height), 1.0)
+			area = float(width * height)
+			# Calculate circularity from detection data if available
+			circularity = detection.get("circularity", 0.5)
+			
+			# Use dynamic template selection based on component characteristics
+			component_type = get_dynamic_template_path(category, subtype, aspect_ratio, area, circularity)
+			
 			category_counters[category] += 1
-			# Include OCR text if available for better component naming
+			
+			# Use letter-based marking as requested: p, m, v, t, o
+			letter = category_to_letter.get(category, category[0] if category else "x")
+			component_number = category_counters[category]
+			
+			# Include OCR text if available for better component identification
 			ocr_name = detection.get("name", "")
 			if ocr_name and isinstance(ocr_name, str) and ocr_name.strip():
-				component_name = f"{category.title()}_{category_counters[category]}_{ocr_name.strip()}"
+				component_name = f"{letter}{component_number}_{ocr_name.strip()}"
 			else:
-				component_name = f"{category.title()}_{category_counters[category]}"
+				component_name = f"{letter}{component_number}"
 		else:
-			component_type = "ia.display.label"
-			label_counter += 1
-			component_name = f"Label_{label_counter}"
+			# Component doesn't match standard categories - count as "other"
+			component_type = category_to_ignition_type.get("other", "Symbol/Other")
+			category_counters["other"] = category_counters.get("other", 0) + 1
+			
+			letter = category_to_letter.get("other", "o")
+			component_number = category_counters["other"]
+			
+			# Include OCR text if available for better component identification
+			ocr_name = detection.get("name", "")
+			if ocr_name and isinstance(ocr_name, str) and ocr_name.strip():
+				component_name = f"{letter}{component_number}_{ocr_name.strip()}"
+			else:
+				component_name = f"{letter}{component_number}"
 		children.append(
 			{
 				"meta": {"name": component_name},
 				"position": {"x": float(x), "y": float(y), "width": float(width), "height": float(height)},
-				"props": {},
-				"type": component_type,
+				"props": {"path": component_type},
+				"type": "ia.display.view",
 			},
 		)
 
+	# Use actual image bounds for canvas sizing if not provided
 	if canvas_width is None or canvas_height is None:
-		max_x = 0.0
-		max_y = 0.0
-		for child in children:
-			pos = child.get("position", {})
-			max_x = max(max_x, float(pos.get("x", 0.0)) + float(pos.get("width", 0.0)))
-			max_y = max(max_y, float(pos.get("y", 0.0)) + float(pos.get("height", 0.0)))
-		canvas_width = int(max(1.0, max_x))
-		canvas_height = int(max(1.0, max_y))
+		if min_x == float('inf') or min_y == float('inf'):
+			# No components detected, use default canvas size
+			canvas_width = 1920
+			canvas_height = 1080
+		else:
+			# Use the actual image dimensions to preserve original positions
+			canvas_width = int(max(1.0, max_x))
+			canvas_height = int(max(1.0, max_y))
+			
+			# Convert pixel coordinates to percentages based on original image dimensions
+			for child in children:
+				pos = child.get("position", {})
+				orig_x = float(pos.get("x", 0.0))
+				orig_y = float(pos.get("y", 0.0))
+				orig_width = float(pos.get("width", 0.0))
+				orig_height = float(pos.get("height", 0.0))
+				
+				# Convert to percentage-based positions (0-1 range) preserving original layout
+				child["position"] = {
+					"x": orig_x / canvas_width,
+					"y": orig_y / canvas_height,
+					"width": orig_width / canvas_width,
+					"height": orig_height / canvas_height
+				}
+	
 	return {
 		"custom": {},
 		"params": {},
@@ -3270,11 +4051,25 @@ async def analyze_pid_image_async(
 	# Text-driven detection and counts (needed for template category selection).
 	ocr_component_detections, ocr_counts, industry = detect_text_driven_components(ocr_detections)
 
+	# Initialize diagram complexity with default value (will be refined later)
+	diagram_complexity = "complex"
+
 	# Run shape detection with OCR context for better classification.
 	shape_stage_start = time.perf_counter()
-	shape_component_detections = await asyncio.to_thread(detect_shape_components, image_array, ocr_detections)
+	shape_component_detections = await asyncio.to_thread(detect_shape_components, image_array, ocr_detections, diagram_complexity)
 	mark_stage("shape_detection", shape_stage_start)
 	logger.info(f"Shape detection found {len(shape_component_detections)} components")
+
+	# Detect diagram complexity for adaptive confidence thresholds
+	complexity_stage_start = time.perf_counter()
+	diagram_complexity = await asyncio.to_thread(
+		detect_diagram_complexity,
+		image_array,
+		ocr_detections,
+		shape_component_detections,
+	)
+	mark_stage("complexity_detection", complexity_stage_start)
+	logger.info(f"Diagram classified as: {diagram_complexity}")
 
 	# Template-match uploaded component reference photos (annotations folder).
 	# Always run template matching for expert-level accuracy using annotation images
@@ -3339,12 +4134,12 @@ async def analyze_pid_image_async(
 				extended_scales=extended_scales,
 			))
 			
-			# Separate task for tank templates with lower threshold
+			# Separate task for tank templates with higher threshold to reduce false positives
 			tank_template_task = asyncio.create_task(asyncio.to_thread(
 				match_annotation_templates,
 				image_array,
 				tank_templates,
-				0.40,  # Even lower threshold for tanks to improve recall
+				0.55,  # Higher threshold to prevent false tank detections
 				extended_scales=extended_scales,
 			))
 			
@@ -3378,7 +4173,7 @@ async def analyze_pid_image_async(
 						match_edges_template,
 						image_array,
 						templates,
-						threshold=0.50,
+						threshold=0.60,
 						extended_scales=True,
 					))
 				)
@@ -3389,7 +4184,7 @@ async def analyze_pid_image_async(
 						match_with_ssim,
 						image_array,
 						templates,
-						threshold=0.55,
+						threshold=0.65,
 						extended_scales=True,
 					))
 				)
@@ -3492,46 +4287,107 @@ async def analyze_pid_image_async(
 	image_h, image_w = image_array.shape[:2]
 	combined_components = apply_context_aware_classification(combined_components, image_w, image_h)
 	
-	# Expert-level: Multi-stage verification pipeline
+	# Expert-level: Multi-stage verification pipeline with diagram complexity awareness
 	# Cross-validate detections using multiple criteria to reduce false positives
+	# Simple diagrams get much stricter thresholds since components are clear and well-separated
+	# Complex diagrams: Very permissive for pumps to ensure detection
 	verified_components = []
 	for det in combined_components:
 		category = det.get("category")
 		confidence = float(det.get("confidence", 0.0))
 		bbox = det.get("bbox")
+		source = det.get("source", "")
+		
+		# Skip OCR-based detections in verification - they're text labels, not component symbols
+		if source == "ocr":
+			continue
+		
+		# Special handling for pumps in complex diagrams - balanced threshold
+		if diagram_complexity == "complex" and category == "pump" and confidence >= 0.18:
+			verified_components.append(det)
+			continue
+		
+		# Special handling for tanks in simple diagrams - require higher confidence to reduce overcounting
+		if diagram_complexity == "simple" and category == "tank" and confidence < 0.45:
+			continue
+		
+		# Special handling for pumps in simple diagrams - require higher confidence to reduce overcounting
+		if diagram_complexity == "simple" and category == "pump" and confidence < 0.45:
+			continue
+		
+		# Adjust thresholds based on diagram complexity
+		if diagram_complexity == "simple":
+			# Simple diagrams: Very strict thresholds to eliminate false positives
+			high_conf_threshold = 0.70
+			medium_conf_threshold = 0.55
+			low_conf_threshold = 0.40
+		else:
+			# Complex diagrams: Much more permissive to maintain recall for crowded components
+			high_conf_threshold = 0.45
+			medium_conf_threshold = 0.35
+			low_conf_threshold = 0.25
 		
 		# High confidence detections pass immediately
-# Tanks/pumps often appear as medium-confidence candidates; allow slightly lower threshold
-		# for these categories so we don't miss real symbols (common in scanned/exported P&IDs).
-		if confidence >= 0.60:
+		if confidence >= high_conf_threshold:
 			verified_components.append(det)
 			continue
-		if confidence >= 0.50 and category in {"tank", "pump"}:
-			verified_components.append(det)
-			continue
-		# Valves also often appear as medium-confidence candidates; give them same treatment as tanks/pumps
-		if confidence >= 0.50 and category == "valve":
-			verified_components.append(det)
-			continue
-
 		
-		# Medium confidence detections need additional verification
-		if confidence >= 0.35 and bbox:
+		# Medium confidence detections for specific categories
+		if confidence >= medium_conf_threshold and category in {"tank", "pump", "valve"}:
+			# For simple diagrams, require additional OCR evidence for medium confidence
+			# For complex diagrams, be more permissive to maintain recall
+			if diagram_complexity == "simple" and bbox:
+				try:
+					nearby = nearby_ocr_texts(bbox, ocr_detections, padding_ratio=0.45)
+					nearby_text = " ".join(item.get("text", "") for item in nearby).strip()
+					
+					has_tag = False
+					if category == "valve":
+						has_tag = bool(_VALVE_TAG_RE.search(nearby_text or ""))
+					elif category == "motor":
+						has_tag = any(pattern.search(nearby_text) for pattern in _COUNTABLE_TEXT_PATTERNS.get("motor", ()))
+					elif category == "pump":
+						has_tag = any(pattern.search(nearby_text) for pattern in _COUNTABLE_TEXT_PATTERNS.get("pump", ()))
+					elif category == "tank":
+						has_tag = any(pattern.search(nearby_text) for pattern in _COUNTABLE_TEXT_PATTERNS.get("tank", ()))
+					
+					if not has_tag:
+						continue
+				except Exception:
+					continue
+			# For complex diagrams, accept medium confidence without OCR evidence
+			verified_components.append(det)
+			continue
+		
+		# Low confidence detections need strong geometry validation
+		if confidence >= low_conf_threshold and bbox:
 			area = float(det.get("area", 0))
 			aspect_ratio = float(det.get("aspect_ratio", 1.0))
+			circularity = float(det.get("circularity", 0.0))
+			solidity = float(det.get("solidity", 0.0))
 			
 			# Verify geometry matches category expectations
 			if category == "tank":
 				# Tanks should have reasonable area and aspect ratio
 				if area >= 150 and (aspect_ratio >= 1.1 or aspect_ratio <= 0.90):
+					# For simple diagrams, require higher solidity
+					if diagram_complexity == "simple" and solidity < 0.50:
+						continue
 					verified_components.append(det)
 			elif category == "valve":
-				# Valves should be compact
-				if area >= 15 and area <= 8000:
+				# Valves should be compact with reasonable circularity
+				if area >= 15 and area <= 8000 and circularity >= 0.20:
+					# For simple diagrams, require higher circularity
+					if diagram_complexity == "simple" and circularity < 0.35:
+						continue
 					verified_components.append(det)
 			elif category in ["motor", "pump"]:
-				# Motors and pumps should have reasonable size
-				if area >= 80 and area <= 3500:
+				# Motors and pumps should have reasonable size and circularity
+				# For complex diagrams, be much more permissive to catch crowded components
+				min_circularity = 0.55 if diagram_complexity == "simple" else 0.25
+				min_area = 80 if diagram_complexity == "simple" else 40
+				max_area = 3500 if diagram_complexity == "simple" else 5000
+				if area >= min_area and area <= max_area and circularity >= min_circularity:
 					verified_components.append(det)
 			else:
 				# Unknown category, keep if reasonable confidence
@@ -3732,7 +4588,7 @@ async def analyze_pid_image_async(
 		solidity = float(det.get("solidity", 0.0) or 0.0)
 		vertex_count = int(det.get("vertex_count", 0) or 0)
 
-		tank_like = _is_tank_like_geometry(area, aspect_ratio, extent, solidity, image_area)
+		tank_like = _is_tank_like_geometry(area, aspect_ratio, extent, solidity, image_area, "complex")
 		valve_like = _is_compact_bowtie_valve(
 			area,
 			aspect_ratio,
@@ -3774,6 +4630,17 @@ async def analyze_pid_image_async(
 		merged_components,
 		iou_threshold=valve_iou_thresh,
 		center_dist_ratio=valve_center_dist,
+		area_ratio_min=0.50,
+		area_ratio_max=2.00,
+	)
+
+	# Pump suppression with moderate thresholds to prevent overcounting
+	pump_iou_thresh = 0.45 if fast_mode else 0.40
+	pump_center_dist = 0.50 if fast_mode else 0.55
+	merged_components = suppress_nearby_pumps(
+		merged_components,
+		iou_threshold=pump_iou_thresh,
+		center_dist_ratio=pump_center_dist,
 		area_ratio_min=0.50,
 		area_ratio_max=2.00,
 	)
@@ -3821,6 +4688,10 @@ async def analyze_pid_image_async(
 	# 	user_library_mode=use_component_library,
 	# )
 
+	# Apply additional validation for simple diagrams to improve accuracy
+	# This helps the model by requiring stronger evidence for clear, uncluttered diagrams
+	visual_detections = apply_simple_diagram_validation(visual_detections, ocr_detections, diagram_complexity)
+
 	# Log visual detections before confidence filtering
 	visual_breakdown = {}
 	for det in visual_detections:
@@ -3828,13 +4699,13 @@ async def analyze_pid_image_async(
 		visual_breakdown[cat] = visual_breakdown.get(cat, 0) + 1
 	logger.info(f"Visual detections before confidence filter: {visual_breakdown}")
 
-	# Fixed confidence thresholds — no adaptive raising based on detection count,
-	# which was incorrectly dropping valid detections when a category had >3 hits
-	# Use higher thresholds in fast mode to reduce false positives
-	active_thresh = FAST_CONF_THRESH.copy() if fast_mode else CONF_THRESH.copy()
+	# Use adaptive confidence thresholds based on diagram complexity
+	# This helps the model by using higher thresholds for simple diagrams (reduce false positives)
+	# and lower thresholds for complex diagrams (maintain recall on crowded layouts)
+	active_thresh = get_adaptive_confidence_thresholds(diagram_complexity, fast_mode)
 	# Increase valve threshold to reduce over-detection from 7 to 3
 	active_thresh["valve"] = 0.35 if fast_mode else 0.30
-	logger.info(f"Active confidence thresholds: {active_thresh}")
+	logger.info(f"Active confidence thresholds (complexity={diagram_complexity}, fast_mode={fast_mode}): {active_thresh}")
 	
 	# Log confidence values for each category
 	conf_by_category = {}
@@ -3860,7 +4731,7 @@ async def analyze_pid_image_async(
 			continue
 		
 			# Category-specific high-confidence thresholds
-		if category == "valve" and conf >= 0.82:
+		if category == "valve" and conf >= 0.78:
 			filtered_detections.append(det)
 			continue
 		elif category == "pump" and conf >= 0.55:
@@ -3953,6 +4824,7 @@ async def analyze_pid_image_async(
 		asyncio.to_thread(
 			detections_to_coordinates_payload,
 			dedupe_detections(filtered_for_coordinates, iou_threshold=0.8),
+			ocr_detections=ocr_detections,
 			canvas_width=int(image_array.shape[1]),
 			canvas_height=int(image_array.shape[0]),
 			),
