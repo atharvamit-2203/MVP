@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type DragEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import './App.css'
 
 // SVG Icon Components
@@ -72,6 +72,19 @@ const ComponentIcon = () => (
     <path d="M12 2L2 7l10 5 10-5-10-5z" />
     <path d="M2 17l10 5 10-5" />
     <path d="M2 12l10 5 10-5" />
+  </svg>
+)
+
+const FullscreenIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+  </svg>
+)
+
+const CloseIcon = () => (
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="18" y1="6" x2="6" y2="18" />
+    <line x1="6" y1="6" x2="18" y2="18" />
   </svg>
 )
 
@@ -163,6 +176,10 @@ type ComponentChild = {
   meta: ComponentMeta
   position: ComponentPosition
   type: string
+  props?: {
+    path?: string
+    params?: Record<string, unknown>
+  }
 }
 
 type RootMeta = {
@@ -191,6 +208,8 @@ type BatchRun = {
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
+const INITIAL_COORDINATE_RENDER_LIMIT = 500
+const COORDINATE_RENDER_INCREMENT = 500
 
 // List of industries that use P&ID diagrams
 const INDUSTRIES = [
@@ -243,28 +262,46 @@ function App() {
   const [selectedIndustry, setSelectedIndustry] = useState<string>('')
   const [componentUploads, setComponentUploads] = useState<ComponentUpload[]>([])
   const [industryWarnings, setIndustryWarnings] = useState<{ component: string[]; pid: string[] }>({ component: [], pid: [] })
+  const [fullscreenPreview, setFullscreenPreview] = useState<string | null>(null)
+  const [componentSectionCollapsed, setComponentSectionCollapsed] = useState(false)
+  const [coordinateRenderLimit, setCoordinateRenderLimit] = useState(INITIAL_COORDINATE_RENDER_LIMIT)
+  const [isRenderingResults, setIsRenderingResults] = useState(false)
 
   const currentFile = selectedFiles[0] ?? null
 
-  const totalDetectedComponents = detection
-    ? detection.pages.reduce((sum, page) => {
-        const c = page.counts
-        return sum + (c.motor ?? 0) + (c.pump ?? 0) + (c.tank ?? 0) + (c.valve ?? 0)
-      }, 0)
-    : 0
+  const totalDetectedComponents = useMemo(
+    () =>
+      detection
+        ? detection.pages.reduce((sum, page) => {
+            const c = page.counts
+            return sum + (c.motor ?? 0) + (c.pump ?? 0) + (c.tank ?? 0) + (c.valve ?? 0)
+          }, 0)
+        : 0,
+    [detection],
+  )
 
-  const batchTotalDetectedComponents = batchRuns.reduce((sum, run) => {
-    const runTotal = run.detection
-      ? run.detection.pages.reduce((pageSum, page) => {
-          const c = page.counts
-          return pageSum + (c.motor ?? 0) + (c.pump ?? 0) + (c.tank ?? 0) + (c.valve ?? 0)
-        }, 0)
-      : 0
-    return sum + runTotal
-  }, 0)
+  const batchTotalDetectedComponents = useMemo(
+    () =>
+      batchRuns.reduce((sum, run) => {
+        const runTotal = run.detection
+          ? run.detection.pages.reduce((pageSum, page) => {
+              const c = page.counts
+              return pageSum + (c.motor ?? 0) + (c.pump ?? 0) + (c.tank ?? 0) + (c.valve ?? 0)
+            }, 0)
+          : 0
+        return sum + runTotal
+      }, 0),
+    [batchRuns],
+  )
 
   const displayedDetectedComponents = batchRuns.length > 0 ? batchTotalDetectedComponents : totalDetectedComponents
   const displayedCoordinateCount = coordinates ? coordinates.root.children.length : 0
+  const coordinateChildren = useMemo(() => coordinates?.root.children ?? [], [coordinates])
+  const renderedCoordinateChildren = useMemo(
+    () => coordinateChildren.slice(0, coordinateRenderLimit),
+    [coordinateChildren, coordinateRenderLimit],
+  )
+  const hasHiddenCoordinates = coordinateChildren.length > renderedCoordinateChildren.length
   const selectedIndustryLabel = selectedIndustry.trim()
   const detectedIndustryLabel = detection?.industry?.trim() || selectedIndustryLabel || 'Not selected'
 
@@ -285,6 +322,28 @@ function App() {
         ...payload.root,
         children: payload.root.children.filter((component) => !isTextCoordinate(component)),
       },
+    }
+  }
+
+  const getComponentLabel = (component: ComponentChild) => {
+    const path = component.props?.path
+    const tagPath = component.props?.params?.TagPath
+    if (typeof path === 'string' && path.length) {
+      return path
+    }
+    if (typeof tagPath === 'string' && tagPath.length) {
+      return `${component.meta.name} • ${tagPath}`
+    }
+    return component.meta.name || component.type
+  }
+
+  const getCoordinateStyle = (position: ComponentPosition) => {
+    const formatValue = (value: number) => (value > 0 && value <= 1 ? `${value * 100}%` : `${value}px`)
+    return {
+      left: formatValue(position.x),
+      top: formatValue(position.y),
+      width: formatValue(position.width),
+      height: formatValue(position.height),
     }
   }
 
@@ -458,39 +517,7 @@ function App() {
     setCoordinates(null)
     setBatchRuns([])
     setActiveTab('upload')
-  }
-
-  const postFileWithIndustry = async (endpoint: string, file: File, industry: string, components: ComponentUpload[]) => {
-    if (!file) {
-      throw new Error('Choose an image or PDF first.')
-    }
-
-    const formData = new FormData()
-    formData.append('file', file)
-    if (industry) {
-      formData.append('industry', industry)
-    }
-    if (components.length > 0) {
-      const componentsData = await Promise.all(
-        components.map(async (comp) => {
-          const base64 = await fileToBase64(comp.file, { maxDimension: 640, quality: 0.8 })
-          return { name: comp.name, file_data: base64 }
-        })
-      )
-      formData.append('components_json', JSON.stringify(componentsData))
-    }
-
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      method: 'POST',
-      body: formData,
-    })
-
-    if (!response.ok) {
-      const payload = (await response.json().catch(() => null)) as { detail?: string } | null
-      throw new Error(payload?.detail ?? `Request failed with status ${response.status}`)
-    }
-
-    return response.json()
+    setCoordinateRenderLimit(INITIAL_COORDINATE_RENDER_LIMIT)
   }
 
   const analyzeFast = async (file: File, industry: string, components: ComponentUpload[]) => {
@@ -579,27 +606,6 @@ function App() {
     })
   }
 
-  const postFile = async (endpoint: string, file: File) => {
-    if (!file) {
-      throw new Error('Choose an image or PDF first.')
-    }
-
-    const formData = new FormData()
-    formData.append('file', file)
-
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      method: 'POST',
-      body: formData,
-    })
-
-    if (!response.ok) {
-      const payload = (await response.json().catch(() => null)) as { detail?: string } | null
-      throw new Error(payload?.detail ?? `Request failed with status ${response.status}`)
-    }
-
-    return response.json()
-  }
-
   const postFiles = async (endpoint: string, files: File[]) => {
     if (!files.length) {
       throw new Error('Choose one or more images or PDFs first.')
@@ -685,12 +691,21 @@ function App() {
 
       setBatchRuns(runs)
       const firstSuccess = runs.find((run) => run.detection && run.coordinates) ?? null
-      setResult(firstSuccess?.result ?? null)
-      setDetection(firstSuccess?.detection ?? null)
-      setCoordinates(firstSuccess?.coordinates ?? null)
-      if (firstSuccess) {
-        setActiveTab('coordinates')
-      }
+      
+      // Add loading state during frontend rendering
+      setIsRenderingResults(true)
+      
+      // Use setTimeout to allow UI to update before heavy rendering
+      setTimeout(() => {
+        setResult(firstSuccess?.result ?? null)
+        setDetection(firstSuccess?.detection ?? null)
+        setCoordinates(firstSuccess?.coordinates ?? null)
+        setCoordinateRenderLimit(INITIAL_COORDINATE_RENDER_LIMIT)
+        setIsRenderingResults(false)
+        if (firstSuccess) {
+          setActiveTab('coordinates')
+        }
+      }, 100)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Run All failed.')
     } finally {
@@ -698,31 +713,30 @@ function App() {
     }
   }
 
-  // State for the downloadable JSON URL
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null)
-
-  // Generate download URL whenever we have all data
-  useEffect(() => {
-    if (batchRuns.length) {
-      const successfulRuns = batchRuns.filter((run) => run.coordinates && !run.error)
-      const payload =
-        successfulRuns.length === 1
-          ? successfulRuns[0].coordinates
-          : {
-              files: successfulRuns.map((run) => ({
-                filename: run.file.name,
-                coordinates: run.coordinates,
-              })),
-            }
-      const combined = JSON.stringify(payload, null, 2)
-      const blob = new Blob([combined], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      setDownloadUrl(url)
-      return () => URL.revokeObjectURL(url)
-    } else {
-      setDownloadUrl(null)
+  const handleDownloadJson = () => {
+    const successfulRuns = batchRuns.filter((run) => run.coordinates && !run.error)
+    if (!successfulRuns.length) {
+      return
     }
-  }, [batchRuns])
+
+    const payload =
+      successfulRuns.length === 1
+        ? successfulRuns[0].coordinates
+        : {
+            files: successfulRuns.map((run) => ({
+              filename: run.file.name,
+              coordinates: run.coordinates,
+            })),
+          }
+    const combined = JSON.stringify(payload)
+    const blob = new Blob([combined], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'output.json'
+    link.click()
+    URL.revokeObjectURL(url)
+  }
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
@@ -761,12 +775,12 @@ function App() {
           <button
             className="primary-button"
             onClick={runAll}
-            disabled={isUploading || selectedFiles.length === 0}
+            disabled={isUploading || isRenderingResults || selectedFiles.length === 0}
           >
-            {isUploading ? (
+            {isUploading || isRenderingResults ? (
               <span className="button-content">
                 <LoadingSpinner />
-                Processing...
+                {isRenderingResults ? 'Rendering...' : 'Processing...'}
               </span>
             ) : (
               <span className="button-content">
@@ -777,13 +791,13 @@ function App() {
               </span>
             )}
           </button>
-          {downloadUrl && (
-            <a href={downloadUrl} download="output.json" className="secondary-button download-button">
+          {batchRuns.length > 0 && (
+            <button type="button" className="secondary-button download-button" onClick={handleDownloadJson}>
               <span className="button-content">
                 <DownloadIcon />
                 Download JSON
               </span>
-            </a>
+            </button>
           )}
           <button 
             className={`nav-item ${activeTab === 'upload' ? 'active' : ''}`}
@@ -847,15 +861,15 @@ function App() {
                 </p>
               </section>
 
-              <section className="workspace">
+              <section className="workspace compact-workspace">
                 {/* Industry Selection */}
-                <div className="upload-card">
-                  <div className="upload-copy">
+                <div className="upload-card compact-card">
+                  <div className="upload-copy compact-copy">
                     <div className="pill">Industry</div>
                     <h2>Select Your Industry</h2>
                     <p>Choose the industry you belong to for accurate component detection and validation.</p>
                   </div>
-                  <div className="upload-controls">
+                  <div className="upload-controls compact-controls">
                     <select
                       className="industry-select"
                       value={selectedIndustry}
@@ -869,14 +883,14 @@ function App() {
                   </div>
                 </div>
 
-                {/* Component Upload Section */}
-                <div className="upload-card">
-                  <div className="upload-copy">
+                {/* Component Upload Section - Collapsible */}
+                <div className="upload-card compact-card">
+                  <div className="upload-copy compact-copy">
                     <div className="pill">Components</div>
                     <h2>Upload Component Photos</h2>
                     <p>Upload reference photos of components (tanks, pumps, motors, valves, etc.) and label each one.</p>
                   </div>
-                  <div className="upload-controls">
+                  <div className="upload-controls compact-controls">
                     <input
                       className="file-input"
                       type="file"
@@ -890,68 +904,89 @@ function App() {
                         Add Components
                       </span>
                     </button>
+                    {componentUploads.length > 0 && (
+                      <button 
+                        type="button"
+                        className="secondary-button collapse-button"
+                        onClick={() => setComponentSectionCollapsed(!componentSectionCollapsed)}
+                      >
+                        {componentSectionCollapsed ? '▼ Show Components' : '▲ Hide Components'}
+                      </button>
+                    )}
                   </div>
-                  {componentUploads.length > 1 && (
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      onClick={() => verifyAllComponentIndustries()}
-                      disabled={!selectedIndustry || componentUploads.every((component) => !component.name || component.verificationStatus === 'pending')}
-                      style={{ marginTop: '12px', width: '100%' }}
-                    >
-                      Verify All Components
-                    </button>
-                  )}
-                  
-                  {componentUploads.length > 0 && (
-                    <div className="component-list">
-                      {componentUploads.map((comp, index) => (
-                        <div key={index} className="component-item">
-                          <img src={comp.previewUrl} alt={comp.name || 'Component'} className="component-preview" />
-                          <input
-                            type="text"
-                            className="component-name-input"
-                            placeholder="Enter component name(s), comma separated..."
-                            value={comp.name}
-                            onChange={(e) => handleComponentNameChange(index, e.target.value)}
-                          />
-                          <div className="component-actions">
-                            <button
-                              type="button"
-                              className="verify-button"
-                              onClick={() => verifyComponentIndustry(index)}
-                              disabled={!comp.name || comp.verificationStatus === 'pending'}
-                            >
-                              {comp.verificationStatus === 'pending' ? 'Verifying...' : 'Verify Industry'}
-                            </button>
-                            <button type="button" className="remove-button" onClick={() => removeComponent(index)}>
-                              ×
-                            </button>
+                  {!componentSectionCollapsed && componentUploads.length > 0 && (
+                    <>
+                      {componentUploads.length > 1 && (
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => verifyAllComponentIndustries()}
+                          disabled={!selectedIndustry || componentUploads.every((component) => !component.name || component.verificationStatus === 'pending')}
+                          style={{ marginTop: '12px', width: '100%' }}
+                        >
+                          Verify All Components
+                        </button>
+                      )}
+                      
+                      <div className="component-list compact-list">
+                        {componentUploads.map((comp, index) => (
+                          <div key={index} className="component-item compact-item">
+                            <div className="component-preview-wrapper">
+                              <img src={comp.previewUrl} alt={comp.name || 'Component'} className="component-preview" />
+                              <button
+                                type="button"
+                                className="fullscreen-button"
+                                onClick={() => setFullscreenPreview(comp.previewUrl)}
+                                title="View full screen"
+                              >
+                                <FullscreenIcon />
+                              </button>
+                            </div>
+                            <input
+                              type="text"
+                              className="component-name-input"
+                              placeholder="Enter component name(s), comma separated..."
+                              value={comp.name}
+                              onChange={(e) => handleComponentNameChange(index, e.target.value)}
+                            />
+                            <div className="component-actions">
+                              <button
+                                type="button"
+                                className="verify-button"
+                                onClick={() => verifyComponentIndustry(index)}
+                                disabled={!comp.name || comp.verificationStatus === 'pending'}
+                              >
+                                {comp.verificationStatus === 'pending' ? 'Verifying...' : 'Verify'}
+                              </button>
+                              <button type="button" className="remove-button" onClick={() => removeComponent(index)}>
+                                ×
+                              </button>
+                            </div>
+                            {comp.verificationStatus === 'verified' && (
+                              <div className="verification-badge verified">✓ Matches {selectedIndustry}</div>
+                            )}
+                            {comp.verificationStatus === 'mismatch' && (
+                              <div className="verification-badge mismatch">⚠ Mismatch</div>
+                            )}
+                            {comp.verificationStatus === 'error' && (
+                              <div className="verification-badge error">✗ Error</div>
+                            )}
+                            {comp.detectedIndustry && comp.verificationStatus !== 'pending' && (
+                              <div className="verification-message">Detected: {comp.detectedIndustry}</div>
+                            )}
+                            {comp.verificationMessage && comp.verificationStatus !== 'pending' && (
+                              <div className="verification-message">{comp.verificationMessage}</div>
+                            )}
                           </div>
-                          {comp.verificationStatus === 'verified' && (
-                            <div className="verification-badge verified">✓ Matches {selectedIndustry}</div>
-                          )}
-                          {comp.verificationStatus === 'mismatch' && (
-                            <div className="verification-badge mismatch">⚠ Industry Mismatch</div>
-                          )}
-                          {comp.verificationStatus === 'error' && (
-                            <div className="verification-badge error">✗ Verification Error</div>
-                          )}
-                          {comp.detectedIndustry && comp.verificationStatus !== 'pending' && (
-                            <div className="verification-message">Detected industry: {comp.detectedIndustry}</div>
-                          )}
-                          {comp.verificationMessage && comp.verificationStatus !== 'pending' && (
-                            <div className="verification-message">{comp.verificationMessage}</div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
+                        ))}
+                      </div>
+                    </>
                   )}
                 </div>
 
                 {/* P&ID Upload Section */}
                 <div
-                  className={`upload-card ${isDragging ? 'dragging' : ''}`}
+                  className={`upload-card compact-card ${isDragging ? 'dragging' : ''}`}
                   onDragEnter={(event) => {
                     event.preventDefault()
                     setIsDragging(true)
@@ -963,7 +998,7 @@ function App() {
                   }}
                   onDrop={handleDrop}
                 >
-                  <div className="upload-copy">
+                  <div className="upload-copy compact-copy">
                     <div className="pill">Upload</div>
                     <h2>Choose the source file</h2>
                     <p>
@@ -978,7 +1013,7 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="upload-controls">
+                  <div className="upload-controls compact-controls">
                     <input
                       ref={fileInputRef}
                       className="file-input"
@@ -1009,16 +1044,13 @@ function App() {
                       <span className="label">Size</span>
                       <strong>{currentFile ? `${(currentFile.size / 1024).toFixed(1)} KB` : '--'}</strong>
                     </div>
-                  </div>
-
-                  <div className="selection-row">
                     <div>
-                      <span className="label">Queued files</span>
+                      <span className="label">Queued</span>
                       <strong>{selectedFiles.length}</strong>
                     </div>
                     <div>
-                      <span className="label">Batch mode</span>
-                      <strong>{selectedFiles.length > 1 ? 'Enabled' : 'Single file'}</strong>
+                      <span className="label">Mode</span>
+                      <strong>{selectedFiles.length > 1 ? 'Batch' : 'Single'}</strong>
                     </div>
                   </div>
 
@@ -1136,10 +1168,20 @@ function App() {
                           {result.frames.length ? (
                             result.frames.map((frame) => (
                               <div className="frame-card" key={frame.page_index}>
-                                <img
-                                  src={`data:image/png;base64,${frame.preview_png_base64}`}
-                                  alt={`Preprocessed page ${frame.page_index}`}
-                                />
+                                <div className="frame-image-wrapper">
+                                  <img
+                                    src={`data:image/png;base64,${frame.preview_png_base64}`}
+                                    alt={`Preprocessed page ${frame.page_index}`}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="fullscreen-button"
+                                    onClick={() => setFullscreenPreview(`data:image/png;base64,${frame.preview_png_base64}`)}
+                                    title="View full screen"
+                                  >
+                                    <FullscreenIcon />
+                                  </button>
+                                </div>
                                 <div className="frame-meta">
                                   <strong>Page {frame.page_index}</strong>
                                   <span>
@@ -1170,8 +1212,8 @@ function App() {
                   ) : null}
                 </div>
 
-                <div className="preview-card">
-                  <div className="card-header">
+                <div className="preview-card compact-card">
+                  <div className="card-header compact-header">
                     <div>
                       <div className="pill muted">Preview</div>
                       <h2>Local source preview</h2>
@@ -1182,6 +1224,14 @@ function App() {
                   {selectedPreviewUrl ? (
                     <div className="preview-wrapper">
                       <img className="preview-image" src={selectedPreviewUrl} alt="Selected upload preview" />
+                      <button
+                        type="button"
+                        className="fullscreen-button"
+                        onClick={() => setFullscreenPreview(selectedPreviewUrl)}
+                        title="View full screen"
+                      >
+                        <FullscreenIcon />
+                      </button>
                       <div className="preview-overlay">
                         <span className="preview-badge">Original</span>
                       </div>
@@ -1212,9 +1262,9 @@ function App() {
                 </p>
               </section>
 
-              <section className="workspace">
-                <article className="result-card">
-                  <div className="card-header">
+              <section className="workspace compact-workspace">
+                <article className="result-card compact-card">
+                  <div className="card-header compact-header">
                     <div>
                       <div className="pill">Industry</div>
                       <h2>{detectedIndustryLabel}</h2>
@@ -1227,15 +1277,15 @@ function App() {
                 </article>
 
                 <section className="json-card compact">
-                  <div className="card-header">
+                  <div className="card-header compact-header">
                     <div>
                       <div className="pill muted">OpenRouter</div>
                       <h2>Component counts</h2>
                     </div>
                   </div>
 
-                  <div className="detection-layout">
-                    <div className="response-summary">
+                  <div className="detection-layout compact-detection">
+                    <div className="response-summary compact-summary">
                       <div><span>Filename</span><strong>{detection.filename}</strong></div>
                       <div><span>Models</span><strong>{detection.models_used.join(' + ')}</strong></div>
                       <div><span>Pages</span><strong>{detection.page_count}</strong></div>
@@ -1243,19 +1293,19 @@ function App() {
                     </div>
 
                     {detection.pages.map((page) => (
-                      <article className="detection-page" key={page.page_index}>
-                        <div className="card-header">
+                      <article className="detection-page compact-page" key={page.page_index}>
+                        <div className="card-header compact-header">
                           <div>
                             <div className="pill muted">Page {page.page_index}</div>
                             <h3>Counts by category</h3>
                           </div>
                         </div>
 
-                        <div className="count-grid">
+                        <div className="count-grid compact-counts">
                           {(['motor', 'pump', 'tank', 'valve'] as const).map((category) => {
                             const count = page.counts[category]
                             return (
-                              <article className="count-card" key={category}>
+                              <article className="count-card compact-count-card" key={category}>
                                 <span>{category}</span>
                                 <strong>{count}</strong>
                               </article>
@@ -1266,21 +1316,21 @@ function App() {
                     ))}
 
                     {detection.component_matches && detection.component_matches.length > 0 && (
-                      <article className="result-card wide">
-                        <div className="card-header">
+                      <article className="result-card wide compact-card">
+                        <div className="card-header compact-header">
                           <div>
                             <div className="pill">Component Matching</div>
                             <h2>Library Matches</h2>
                           </div>
                         </div>
 
-                        <div className="component-matches-grid">
+                        <div className="component-matches-grid compact-matches">
                           {detection.component_matches.map((match, index) => (
-                            <div className={`component-match-card ${match.matches ? 'matched' : 'unmatched'}`} key={index}>
+                            <div className={`component-match-card compact-match ${match.matches ? 'matched' : 'unmatched'}`} key={index}>
                               <div className="match-header">
                                 <strong>{match.component_name}</strong>
                                 <span className={`match-badge ${match.matches ? 'success' : 'warning'}`}>
-                                  {match.matches ? '✓ Match' : '✗ No Match'}
+                                  {match.matches ? '✓' : '✗'}
                                 </span>
                               </div>
                               <div className="match-details">
@@ -1307,13 +1357,13 @@ function App() {
                   <p className="lede">
                     Component coordinates for {currentFile?.name || 'uploaded file'} - {displayedCoordinateCount} components detected
                   </p>
-                  <p className="lede">
-                    Detected components total: {displayedDetectedComponents}<br />
-                    Coordinate entries: {displayedCoordinateCount}<br />
-                    Difference: {displayedDetectedComponents - displayedCoordinateCount}
-                  </p>
+                  <div className="stats-row">
+                    <span>Total: {displayedDetectedComponents}</span>
+                    <span>Coordinates: {displayedCoordinateCount}</span>
+                    <span>Missing: {displayedDetectedComponents - displayedCoordinateCount}</span>
+                  </div>
                   {displayedDetectedComponents - displayedCoordinateCount > 0 && (
-                    <div className="warning-banner">
+                    <div className="warning-banner compact-warning">
                       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                         <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
                         <line x1="12" y1="9" x2="12" y2="13" />
@@ -1325,20 +1375,20 @@ function App() {
                 </section>
 
               {batchRuns.length > 1 ? (
-                <section className="workspace">
-                  <article className="result-card wide">
-                    <div className="card-header">
+                <section className="workspace compact-workspace">
+                  <article className="result-card wide compact-card">
+                    <div className="card-header compact-header">
                       <div>
                         <div className="pill muted">Batch</div>
                         <h2>Visible coordinates by file</h2>
                       </div>
                     </div>
-                    <div className="frame-grid">
+                    <div className="frame-grid compact-frame-grid">
                       {batchRuns.map((run) => {
                         const visibleCount = run.coordinates?.root.children.length ?? 0
                         return (
-                          <div className="frame-card" key={run.file.name}>
-                            <div className="frame-meta">
+                          <div className="frame-card compact-frame-card" key={run.file.name}>
+                            <div className="frame-meta compact-frame-meta">
                               <strong>{run.file.name}</strong>
                               <span>Industry: {run.detection?.industry || selectedIndustryLabel || 'Not selected'}</span>
                               <span>{visibleCount} visible coordinates</span>
@@ -1360,9 +1410,9 @@ function App() {
                 </section>
               ) : null}
 
-              <section className="workspace">
-                <article className="result-card">
-                  <div className="card-header">
+              <section className="workspace compact-workspace">
+                <article className="result-card compact-card">
+                  <div className="card-header compact-header">
                     <div>
                       <div className="pill">Coordinates</div>
                       <h2>Detected Components</h2>
@@ -1374,35 +1424,82 @@ function App() {
                 </article>
 
                 <section className="json-card compact">
-                  <div className="card-header">
+                  <div className="card-header compact-header">
+                    <div>
+                      <div className="pill muted">Preview</div>
+                      <h2>Inspection Overlay</h2>
+                    </div>
+                  </div>
+                  <div className="coordinate-preview">
+                    {selectedPreviewUrl ? (
+                      <div className="preview-wrapper">
+                        <img src={selectedPreviewUrl} alt="P&ID preview" className="preview-image" />
+                        <button
+                          type="button"
+                          className="fullscreen-button"
+                          onClick={() => setFullscreenPreview(selectedPreviewUrl)}
+                          title="View full screen"
+                        >
+                          <FullscreenIcon />
+                        </button>
+                        <div className="coordinate-overlay">
+                          {renderedCoordinateChildren.map((component, index) => (
+                            <div
+                              key={index}
+                              className="coordinate-box"
+                              style={getCoordinateStyle(component.position)}
+                            >
+                              <span className="coordinate-box-label">{getComponentLabel(component)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <p>No preview available for overlay. Upload an image to see detected component positions.</p>
+                    )}
+                  </div>
+                </section>
+
+                <section className="json-card compact">
+                  <div className="card-header compact-header">
                     <div>
                       <div className="pill muted">Components</div>
                       <h2>Position Data</h2>
                     </div>
                   </div>
 
-                  <div className="coordinates-grid">
-                    {coordinates.root.children.map((component, index) => (
-                      <article className="coordinate-card" key={index}>
-                        <div className="coordinate-header">
+                  <div className="coordinates-grid compact-coordinates">
+                    {renderedCoordinateChildren.map((component, index) => (
+                      <article className="coordinate-card compact-coordinate-card" key={index}>
+                        <div className="coordinate-header compact-coordinate-header">
                           <div className="pill component-type">{component.type.replace('ia.symbol.', '')}</div>
                           <strong>{component.meta.name}</strong>
                           <span className="component-icon"><ComponentIcon /></span>
                         </div>
-                        <div className="coordinate-details">
-                          <div className="coordinate-item">
+                        <div className="coordinate-details compact-coordinate-details">
+                          <div className="coordinate-item compact-coordinate-item">
+                            <span>Path</span>
+                            <strong>{component.props?.path || 'N/A'}</strong>
+                          </div>
+                          {typeof component.props?.params?.TagPath === 'string' ? (
+                            <div className="coordinate-item compact-coordinate-item">
+                              <span>TagPath</span>
+                              <strong>{component.props.params.TagPath}</strong>
+                            </div>
+                          ) : null}
+                          <div className="coordinate-item compact-coordinate-item">
                             <span>X</span>
                             <strong>{component.position.x}</strong>
                           </div>
-                          <div className="coordinate-item">
+                          <div className="coordinate-item compact-coordinate-item">
                             <span>Y</span>
                             <strong>{component.position.y}</strong>
                           </div>
-                          <div className="coordinate-item">
+                          <div className="coordinate-item compact-coordinate-item">
                             <span>Width</span>
                             <strong>{component.position.width}</strong>
                           </div>
-                          <div className="coordinate-item">
+                          <div className="coordinate-item compact-coordinate-item">
                             <span>Height</span>
                             <strong>{component.position.height}</strong>
                           </div>
@@ -1410,12 +1507,39 @@ function App() {
                       </article>
                     ))}
                   </div>
+                  {hasHiddenCoordinates ? (
+                    <div style={{ marginTop: '12px', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+                      <span className="hint">
+                        Showing {renderedCoordinateChildren.length} of {coordinateChildren.length} coordinates for faster rendering.
+                      </span>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() =>
+                          setCoordinateRenderLimit((current) =>
+                            Math.min(current + COORDINATE_RENDER_INCREMENT, coordinateChildren.length),
+                          )
+                        }
+                      >
+                        Load more
+                      </button>
+                    </div>
+                  ) : null}
                 </section>
               </section>
             </>
           )}
         </main>
       </div>
+
+      {fullscreenPreview && (
+        <div className="fullscreen-modal" onClick={() => setFullscreenPreview(null)}>
+          <button className="fullscreen-close" onClick={(e) => { e.stopPropagation(); setFullscreenPreview(null) }}>
+            <CloseIcon />
+          </button>
+          <img src={fullscreenPreview} alt="Full screen preview" className="fullscreen-image" />
+        </div>
+      )}
     </div>
   )
 }
