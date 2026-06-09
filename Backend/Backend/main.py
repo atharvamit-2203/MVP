@@ -668,7 +668,7 @@ async def build_detection_response(file: UploadFile, industry: str | None = None
 					)
 					
 					best_match = library_matches[0] if library_matches else None
-					matches_bool = best_match and best_match["similarity"] > 0.7
+					matches_bool = best_match is not None and best_match["similarity"] > 0.7
 					
 					component_matches.append(ComponentMatch(
 						component_name=component_name,
@@ -680,6 +680,14 @@ async def build_detection_response(file: UploadFile, industry: str | None = None
 					))
 				except Exception as exc:
 					logger.warning(f"Failed to match component {component_name}: {exc}")
+					component_matches.append(ComponentMatch(
+						component_name=component_name,
+						component_category=component_category,
+						matched_library_image=None,
+						matched_library_label=None,
+						similarity_score=0.0,
+						matches=False
+					))
 	except Exception as exc:
 		logger.warning(f"Component matching failed: {exc}")
 
@@ -776,7 +784,7 @@ async def build_detection_and_coordinate_response(
 				)
 				
 				best_match = library_matches[0] if library_matches else None
-				matches_bool = best_match and best_match["similarity"] > 0.7
+				matches_bool = best_match is not None and best_match["similarity"] > 0.7
 				
 				component_matches.append(ComponentMatch(
 					component_name=component_name,
@@ -788,6 +796,14 @@ async def build_detection_and_coordinate_response(
 				))
 			except Exception as exc:
 				logger.warning(f"Failed to match component {component_name}: {exc}")
+				component_matches.append(ComponentMatch(
+					component_name=component_name,
+					component_category=component_category,
+					matched_library_image=None,
+					matched_library_label=None,
+					similarity_score=0.0,
+					matches=False
+				))
 	except Exception as exc:
 		logger.warning(f"Component matching failed: {exc}")
 
@@ -920,7 +936,7 @@ async def match_components(request: ComponentMatchingRequest, file: UploadFile =
 			
 			# Determine if it matches (similarity > 0.7)
 			best_match = library_matches[0] if library_matches else None
-			matches_bool = best_match and best_match["similarity"] > 0.7
+			matches_bool = best_match is not None and best_match["similarity"] > 0.7
 			
 			matches.append(ComponentMatch(
 				component_name=component_name,

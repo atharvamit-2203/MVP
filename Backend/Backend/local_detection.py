@@ -276,14 +276,14 @@ SIMPLE_CONF_THRESH: dict[str, float] = {
 }
 
 # Confidence thresholds for complex P&ID diagrams (dense, overlapping elements)
-# Optimized for better recall in crowded diagrams
+# Tightened to reduce valve overcounting while maintaining reasonable recall
 COMPLEX_CONF_THRESH: dict[str, float] = {
-	"motor": 0.18,  # Slightly lowered
-	"pump": 0.15,  # Slightly lowered
-	"tank": 0.12,  # Slightly lowered
-	"valve": 0.18,  # Slightly lowered
-	"instrument": 0.12,  # Slightly lowered
-	"other": 0.20,
+	"motor": 0.25,  # Increased to reduce false positives
+	"pump": 0.25,  # Increased to reduce false positives
+	"tank": 0.20,  # Increased to reduce false positives
+	"valve": 0.35,  # Significantly increased to reduce valve overcounting
+	"instrument": 0.20,  # Increased to reduce false positives
+	"other": 0.30,
 }
 
 
@@ -1167,7 +1167,7 @@ def _is_compact_bowtie_valve(
 	bbox: tuple[int, int, int, int] | None = None,
 ) -> bool:
 	"""Classic on-sheet bow-tie valve symbol (compact, nearly square).
-	Expert-level: More permissive thresholds to catch more valve variants."""
+	Tightened thresholds to reduce false positives in complex diagrams."""
 	if not _is_valve_like_geometry(
 		area,
 		aspect_ratio,
@@ -1181,16 +1181,16 @@ def _is_compact_bowtie_valve(
 	):
 		return False
 	eff_aspect = _effective_aspect_ratio(aspect_ratio)
-	if eff_aspect > 4.0:  # Relaxed aspect ratio threshold
+	if eff_aspect > 3.0:  # Tightened aspect ratio threshold
 		return False
-	if area < 10.0:  # Relaxed minimum area
+	if area < 25.0:  # Increased minimum area
 		return False
-	max_area = 8000.0  # Increased max area
+	max_area = 6000.0  # Reduced max area
 	if image_area is not None:
-		max_area = max(max_area, image_area * 0.01)  # Increased area multiplier
+		max_area = max(max_area, image_area * 0.008)  # Reduced area multiplier
 	if area > max_area:
 		return False
-	if circularity > 0.90:  # Relaxed circularity threshold
+	if circularity > 0.85:  # Tightened circularity threshold
 		return False
 	return True
 
@@ -1207,7 +1207,7 @@ def _is_valve_like_geometry(
 	bbox: tuple[int, int, int, int] | None = None,
 ) -> bool:
 	"""Bow-tie / diamond valve symbols on P&IDs (compact, low circularity).
-	Expert-level: More permissive thresholds to catch more valve variants."""
+	Tightened thresholds to reduce false positives in complex diagrams."""
 	if tank_like and area > 1500.0:
 		return False
 	if image_area is not None and area > _max_valve_area(image_area):
@@ -1219,20 +1219,20 @@ def _is_valve_like_geometry(
 		max_symbol = math.sqrt(image_area) * 0.28
 		if max(_bw, _bh) > max_symbol:
 			return False
-	# Expert-level: Wider vertex count range for various valve shapes
-	if not (3 <= vertex_count <= 25):
+	# Tightened vertex count range to reduce false positives
+	if not (4 <= vertex_count <= 20):
 		return False
-	# Expert-level: Wider aspect ratio range
-	if not (0.15 <= aspect_ratio <= 5.0):
+	# Tightened aspect ratio range
+	if not (0.35 <= aspect_ratio <= 3.5):
 		return False
-	# Expert-level: Wider circularity range
-	if not (0.01 <= circularity <= 0.95):
+	# Tightened circularity range
+	if not (0.15 <= circularity <= 0.88):
 		return False
-	# Expert-level: Wider extent range
-	if not (0.04 <= extent <= 0.99):
+	# Tightened extent range
+	if not (0.12 <= extent <= 0.95):
 		return False
-	# Expert-level: More permissive solidity threshold
-	if solidity > 0.99:
+	# Tightened solidity threshold
+	if solidity > 0.97:
 		return False
 	return True
 
@@ -1430,17 +1430,17 @@ def classify_visual_candidate(
 		tank_like=tank_like,
 		bbox=candidate_box,
 	):
-		# Balanced geometry checks to detect valves without over-counting
-		if (circularity <= 0.85 and 
-		    solidity >= 0.25 and 
-		    extent >= 0.15 and 
-		    vertex_count >= 3):
+		# Tightened geometry checks to reduce valve overcounting
+		if (circularity <= 0.82 and 
+		    solidity >= 0.35 and 
+		    extent >= 0.20 and 
+		    vertex_count >= 4):
 			confidence = min(
-				0.85,
-				0.55
-				+ (0.20 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0)))
-				+ (0.15 if vertex_count >= 4 else 0.0)
-				+ (0.10 if solidity <= 0.70 else 0.0),
+				0.82,
+				0.50
+				+ (0.18 * (1.0 - min(abs(1.0 - aspect_ratio), 1.0)))
+				+ (0.12 if vertex_count >= 5 else 0.0)
+				+ (0.08 if solidity <= 0.65 else 0.0),
 			)
 			return "valve", nearby_text or "Valve", confidence
 
@@ -1573,22 +1573,22 @@ def detect_shape_components(
 		# Relaxed thresholds to catch more components while maintaining reasonable accuracy
 		# Adaptive thresholds based on diagram complexity for optimal accuracy
 		if category == "valve":
-			# Extremely strict valve detection to reduce from 8 to 3
-			# Only detect valves with the clearest geometric signatures
+			# Relaxed valve detection to improve recall while maintaining reasonable precision
 			if diagram_complexity == "simple":
-				min_circularity = 0.50
-				max_circularity = 0.88
-				min_solidity = 0.50
-				max_aspect_ratio = 2.0
-				min_aspect_ratio = 0.50
-				min_area = 120
+				min_circularity = 0.40
+				max_circularity = 0.92
+				min_solidity = 0.40
+				max_aspect_ratio = 3.0
+				min_aspect_ratio = 0.33
+				min_area = 80
 			else:
-				min_circularity = 0.45
+				# Relaxed thresholds for complex diagrams to detect more valves
+				min_circularity = 0.42
 				max_circularity = 0.90
-				min_solidity = 0.45
-				max_aspect_ratio = 2.5
-				min_aspect_ratio = 0.40
-				min_area = 100
+				min_solidity = 0.42
+				max_aspect_ratio = 3.0
+				min_aspect_ratio = 0.33
+				min_area = 90
 			if circularity < min_circularity or circularity > max_circularity:
 				continue
 			if aspect_ratio > max_aspect_ratio or aspect_ratio < min_aspect_ratio:
