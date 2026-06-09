@@ -1004,7 +1004,7 @@ async def build_coordinate_response(file: UploadFile) -> CoordinateDetectionResp
 		logger.error(f"Coordinate detection failed: {exc}")
 		try:
 			coordinates = await detect_coordinates_async(frames[0])
-			logger.info("Fallback to local detection successful")
+			logger.info("Fallback to coordinate detection successful")
 		except Exception as fallback_exc:  # noqa: BLE001
 			logger.error(f"Fallback detection also failed: {fallback_exc}")
 			raise HTTPException(status_code=502, detail=str(exc)) from exc

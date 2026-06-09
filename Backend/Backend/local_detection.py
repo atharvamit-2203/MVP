@@ -3751,7 +3751,7 @@ def detections_to_coordinates_payload(
 		# Skip OCR-based detections for coordinate marking - they circle text instead of symbols
 		# Only use shape-based detections for accurate component symbol circling
 		if source == "ocr":
-			continue
+		 continue
 		
 		# Track bounds for canvas sizing
 		min_x = min(min_x, float(x))

@@ -258,7 +258,7 @@ function App() {
   const [coordinates, setCoordinates] = useState<CoordinateDetectionResponse | null>(null)
   const [selectedPreviewUrl, setSelectedPreviewUrl] = useState<string | null>(null)
   const [batchRuns, setBatchRuns] = useState<BatchRun[]>([])
-  const [activeTab, setActiveTab] = useState<'upload' | 'results' | 'coordinates'>('upload')
+  const [activeTab, setActiveTab] = useState<'upload' | 'results' | 'coordinates' | 'json-render'>('upload')
   const [selectedIndustry, setSelectedIndustry] = useState<string>('')
   const [componentUploads, setComponentUploads] = useState<ComponentUpload[]>([])
   const [industryWarnings, setIndustryWarnings] = useState<{ component: string[]; pid: string[] }>({ component: [], pid: [] })
@@ -266,6 +266,8 @@ function App() {
   const [componentSectionCollapsed, setComponentSectionCollapsed] = useState(false)
   const [coordinateRenderLimit, setCoordinateRenderLimit] = useState(INITIAL_COORDINATE_RENDER_LIMIT)
   const [isRenderingResults, setIsRenderingResults] = useState(false)
+  const [pastedJson, setPastedJson] = useState<string>('')
+  const [parsedJsonData, setParsedJsonData] = useState<CoordinateDetectionResponse | null>(null)
 
   const currentFile = selectedFiles[0] ?? null
 
@@ -744,6 +746,54 @@ function App() {
     handleFilesSelect(Array.from(event.dataTransfer.files))
   }
 
+  const handleJsonPaste = (jsonString: string) => {
+    try {
+      const parsed = JSON.parse(jsonString) as CoordinateDetectionResponse
+      setParsedJsonData(parsed)
+      setError(null)
+    } catch (e) {
+      setError('Invalid JSON format')
+      setParsedJsonData(null)
+    }
+  }
+
+  const getNormalizedJsonForIgnition = (jsonData: CoordinateDetectionResponse) => {
+    const normalized = JSON.parse(JSON.stringify(jsonData)) as CoordinateDetectionResponse
+    
+    if (normalized.root && normalized.root.children) {
+      const components = normalized.root.children.filter((component) => !isTextCoordinate(component))
+      if (components.length > 0) {
+        // Preserve exact P&ID coordinates without any shifting
+        // Only apply minimum size constraint for visibility
+        // Don't adjust position when size increases - keep original top-left position
+        const minComponentSize = 80 // Minimum 80px for visibility in Ignition Designer
+        normalized.root.children = normalized.root.children.map((component) => {
+          if (isTextCoordinate(component)) return component
+          
+          const originalWidth = component.position.width
+          const originalHeight = component.position.height
+          
+          // Apply minimum size constraint
+          const finalWidth = Math.max(originalWidth, minComponentSize)
+          const finalHeight = Math.max(originalHeight, minComponentSize)
+          
+          // Keep original position - don't adjust when size increases
+          return {
+            ...component,
+            position: {
+              x: component.position.x,
+              y: component.position.y,
+              width: finalWidth,
+              height: finalHeight
+            }
+          }
+        })
+      }
+    }
+    
+    return normalized
+  }
+
   useEffect(() => {
     if (!currentFile || !supportsPreview) {
       setSelectedPreviewUrl(null)
@@ -826,6 +876,15 @@ function App() {
             <span className="nav-item-content">
               <CoordinatesIcon />
               Coordinates
+            </span>
+          </button>
+          <button 
+            className={`nav-item ${activeTab === 'json-render' ? 'active' : ''}`}
+            onClick={() => setActiveTab('json-render')}
+          >
+            <span className="nav-item-content">
+              <AnalysisIcon />
+              JSON Render
             </span>
           </button>
         </nav>
@@ -1526,6 +1585,142 @@ function App() {
                     </div>
                   ) : null}
                 </section>
+              </section>
+            </>
+          )}
+
+          {activeTab === 'json-render' && (
+            <>
+              <section className="hero-panel compact-hero">
+                <p className="lede">
+                  Paste JSON coordinates to render components on a white screen with perfect positioning
+                </p>
+              </section>
+
+              <section className="workspace compact-workspace">
+                <article className="result-card compact-card">
+                  <div className="card-header compact-header">
+                    <div>
+                      <div className="pill">JSON Input</div>
+                      <h2>Paste Coordinates JSON</h2>
+                    </div>
+                  </div>
+                  <textarea
+                    className="json-textarea"
+                    placeholder="Paste your JSON coordinates here..."
+                    value={pastedJson}
+                    onChange={(e) => setPastedJson(e.target.value)}
+                    rows={10}
+                  />
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={() => handleJsonPaste(pastedJson)}
+                    disabled={!pastedJson.trim()}
+                    style={{ marginTop: '12px' }}
+                  >
+                    Render Components
+                  </button>
+                  {parsedJsonData && (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        const normalizedJson = getNormalizedJsonForIgnition(parsedJsonData)
+                        const jsonString = JSON.stringify(normalizedJson, null, 2)
+                        navigator.clipboard.writeText(jsonString)
+                        alert('Normalized JSON copied to clipboard! Paste this into Ignition Designer.')
+                      }}
+                      style={{ marginTop: '12px', marginLeft: '10px' }}
+                    >
+                      Copy Normalized JSON for Ignition Designer
+                    </button>
+                  )}
+                </article>
+
+                {parsedJsonData && (
+                  <article className="result-card wide compact-card">
+                    <div className="card-header compact-header">
+                      <div>
+                        <div className="pill">White Screen Canvas</div>
+                        <h2>Component Rendering</h2>
+                      </div>
+                    </div>
+                    <div className="white-screen-canvas" style={{ 
+                      position: 'relative', 
+                      width: '100%', 
+                      height: '600px', 
+                      backgroundColor: 'white',
+                      border: '1px solid #ccc',
+                      overflow: 'auto'
+                    }}>
+                      {(() => {
+                        const components = parsedJsonData.root.children.filter((component) => !isTextCoordinate(component))
+                        if (components.length === 0) return null
+                        
+                        // Calculate bounds to determine canvas size
+                        const maxX = Math.max(...components.map(c => c.position.x + c.position.width))
+                        const maxY = Math.max(...components.map(c => c.position.y + c.position.height))
+                        const minX = Math.min(...components.map(c => c.position.x))
+                        const minY = Math.min(...components.map(c => c.position.y))
+                        
+                        const contentWidth = Math.max(maxX - minX + 200, 800) // Minimum 800px width
+                        const contentHeight = Math.max(maxY - minY + 200, 600) // Minimum 600px height
+                        
+                        return (
+                          <div style={{
+                            position: 'relative',
+                            width: `${contentWidth}px`,
+                            height: `${contentHeight}px`,
+                            backgroundColor: 'white',
+                            margin: '20px'
+                          }}>
+                            {components.map((component, index) => {
+                              const position = component.position
+                              const adjustedX = position.x - minX + 100
+                              const adjustedY = position.y - minY + 100
+                              
+                              // Ensure minimum size for visibility
+                              const displayWidth = Math.max(position.width, 50)
+                              const displayHeight = Math.max(position.height, 50)
+                              
+                              return (
+                                <div
+                                  key={index}
+                                  className="component-box"
+                                  style={{
+                                    position: 'absolute',
+                                    left: `${adjustedX}px`,
+                                    top: `${adjustedY}px`,
+                                    width: `${displayWidth}px`,
+                                    height: `${displayHeight}px`,
+                                    border: '3px solid #333',
+                                    backgroundColor: 'rgba(66, 133, 244, 0.3)',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    fontSize: '16px',
+                                    color: '#333',
+                                    fontWeight: 'bold',
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    whiteSpace: 'nowrap',
+                                    padding: '8px',
+                                    borderRadius: '6px',
+                                    boxShadow: '0 4px 8px rgba(0,0,0,0.15)',
+                                    zIndex: 1
+                                  }}
+                                >
+                                  {getComponentLabel(component)}
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )
+                      })()}
+                    </div>
+                  </article>
+                )}
               </section>
             </>
           )}
