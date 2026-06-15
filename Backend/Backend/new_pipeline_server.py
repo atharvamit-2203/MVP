@@ -206,6 +206,13 @@ async def analyze_with_new_pipeline_endpoint(file: UploadFile = File(...), indus
             component_matches=[]
         )
         
+        # Convert to dict and inject pipe count directly for frontend consumption
+        detection_dict = detection_response.dict()
+        if detection_dict.get("pages") and len(detection_dict["pages"]) > 0:
+            detection_dict["pages"][0]["counts"]["pipe"] = int(counts.get("pipe", 0))
+            for mr in detection_dict["pages"][0].get("model_results", []):
+                mr["counts"]["pipe"] = int(counts.get("pipe", 0))
+        
         # Build coordinate response
         try:
             coordinate_response = CoordinateDetectionResponse(**coordinates)
@@ -227,7 +234,7 @@ async def analyze_with_new_pipeline_endpoint(file: UploadFile = File(...), indus
         
         # Return in format expected by frontend
         return {
-            "detection": detection_response,
+            "detection": detection_dict,
             "coordinates": coordinate_response,
             "pipeline_info": {
                 "pipeline": "new_4_phase",

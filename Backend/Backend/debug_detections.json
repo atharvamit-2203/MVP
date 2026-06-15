@@ -1,25 +1,25 @@
 {
   "counts": {
-    "motor": 2,
-    "pump": 0,
-    "tank": 3,
-    "valve": 5,
+    "motor": 19,
+    "pump": 16,
+    "tank": 7,
+    "valve": 39,
     "instrument": 0,
     "other": 0
   },
   "vision_counts": {
-    "motor": 2,
-    "pump": 0,
-    "tank": 3,
-    "valve": 5,
+    "motor": 19,
+    "pump": 16,
+    "tank": 7,
+    "valve": 39,
     "instrument": 0,
     "other": 0
   },
   "phi3_counts": {
-    "motor": 2,
-    "pump": 0,
-    "tank": 3,
-    "valve": 5,
+    "motor": 19,
+    "pump": 16,
+    "tank": 7,
+    "valve": 39,
     "instrument": 0,
     "other": 0
   },
@@ -27,91 +27,730 @@
     {
       "category": "tank",
       "confidence": 0.75,
-      "area": 2374.0,
-      "circularity": 0.5756110440675669,
+      "area": 26419.0,
+      "circularity": 0.6646156685233884,
+      "solidity": 0.9624408014571949,
+      "aspect": 0.930635838150289,
+      "source": "shape"
+    },
+    {
+      "category": "tank",
+      "confidence": 0.75,
+      "area": 9608.0,
+      "circularity": 0.7898684013941559,
+      "solidity": 0.992305706170927,
+      "aspect": 1.0515463917525774,
+      "source": "shape"
+    },
+    {
+      "category": "tank",
+      "confidence": 0.75,
+      "area": 9544.5,
+      "circularity": 0.7889649345208987,
+      "solidity": 0.9924612665072268,
+      "aspect": 1.0515463917525774,
+      "source": "shape"
+    },
+    {
+      "category": "tank",
+      "confidence": 0.75,
+      "area": 9098.0,
+      "circularity": 0.7931828343052119,
       "solidity": 1.0,
-      "aspect": 3.1785714285714284,
+      "aspect": 0.9108910891089109,
+      "source": "shape"
+    },
+    {
+      "category": "tank",
+      "confidence": 0.75,
+      "area": 7990.0,
+      "circularity": 0.7953031760396729,
+      "solidity": 0.999687206756334,
+      "aspect": 1.0804597701149425,
       "source": "shape"
     },
     {
       "category": "tank",
       "confidence": 0.7000000000000001,
-      "area": 6685.0,
-      "circularity": 0.6997480466278719,
-      "solidity": 0.9973146352379532,
-      "aspect": 2.0517241379310347,
+      "area": 9959.0,
+      "circularity": 0.5311674790519141,
+      "solidity": 0.8735581772729266,
+      "aspect": 2.111111111111111,
       "source": "shape"
     },
     {
       "category": "tank",
       "confidence": 0.7000000000000001,
-      "area": 2728.0,
-      "circularity": 0.5760818429884008,
-      "solidity": 0.9970760233918129,
-      "aspect": 0.28431372549019607,
+      "area": 9707.0,
+      "circularity": 0.7773074265568729,
+      "solidity": 0.9937042534677791,
+      "aspect": 0.7719298245614035,
       "source": "shape"
     },
     {
       "category": "valve",
-      "confidence": 0.7810526315789473,
-      "area": 219.0,
-      "circularity": 0.5761536089211937,
-      "solidity": 0.9279661016949152,
-      "aspect": 1.105263157894737,
+      "confidence": 0.785,
+      "area": 103.0,
+      "circularity": 0.5322452138954815,
+      "solidity": 0.8174603174603174,
+      "aspect": 1.0833333333333333,
       "source": "shape"
     },
     {
       "category": "valve",
-      "confidence": 0.7810526315789473,
-      "area": 219.0,
-      "circularity": 0.5761536089211937,
-      "solidity": 0.9279661016949152,
-      "aspect": 1.105263157894737,
+      "confidence": 0.7631818181818182,
+      "area": 937.0,
+      "circularity": 0.7069809374409747,
+      "solidity": 0.9110354885755956,
+      "aspect": 0.7954545454545454,
       "source": "shape"
     },
     {
       "category": "valve",
-      "confidence": 0.7672727272727272,
-      "area": 96.0,
-      "circularity": 0.679278738255143,
-      "solidity": 0.8888888888888888,
-      "aspect": 1.1818181818181819,
+      "confidence": 0.7571428571428571,
+      "area": 785.5,
+      "circularity": 0.6596585677261201,
+      "solidity": 0.8870694522868436,
+      "aspect": 0.7619047619047619,
       "source": "shape"
     },
     {
       "category": "valve",
       "confidence": 0.75,
-      "area": 126.0,
-      "circularity": 0.4259317417628651,
-      "solidity": 0.7777777777777778,
-      "aspect": 1.7272727272727273,
+      "area": 136.5,
+      "circularity": 0.48360010238426976,
+      "solidity": 0.8557993730407524,
+      "aspect": 2.1,
       "source": "shape"
     },
     {
       "category": "valve",
-      "confidence": 0.7154545454545455,
-      "area": 137.5,
-      "circularity": 0.5434866032456205,
-      "solidity": 0.8540372670807453,
-      "aspect": 1.6363636363636365,
+      "confidence": 0.75,
+      "area": 151.5,
+      "circularity": 0.49460225950785486,
+      "solidity": 0.8393351800554016,
+      "aspect": 1.9090909090909092,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 184.5,
+      "circularity": 0.42291617020865363,
+      "solidity": 0.796976241900648,
+      "aspect": 2.0,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 189.5,
+      "circularity": 0.46956750951417914,
+      "solidity": 0.8063829787234043,
+      "aspect": 2.272727272727273,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 198.0,
+      "circularity": 0.4611289111317869,
+      "solidity": 0.8181818181818182,
+      "aspect": 2.3636363636363638,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 124.0,
+      "circularity": 0.45555244725813004,
+      "solidity": 0.8794326241134752,
+      "aspect": 2.75,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 114.5,
+      "circularity": 0.6362068535919911,
+      "solidity": 0.8841698841698842,
+      "aspect": 1.8,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 102.5,
+      "circularity": 0.5899032593328556,
+      "solidity": 0.8836206896551724,
+      "aspect": 2.0,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 111.0,
+      "circularity": 0.6231016003304141,
+      "solidity": 0.921161825726141,
+      "aspect": 2.0,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 115.5,
+      "circularity": 0.6326011586933246,
+      "solidity": 0.9314516129032258,
+      "aspect": 2.0,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 776.5,
+      "circularity": 0.47068500608969355,
+      "solidity": 0.7575609756097561,
+      "aspect": 1.65625,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 166.5,
+      "circularity": 0.4817923854763982,
+      "solidity": 0.9073569482288828,
+      "aspect": 2.7777777777777777,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 93.5,
+      "circularity": 0.5873054542902322,
+      "solidity": 0.8657407407407407,
+      "aspect": 1.8888888888888888,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 120.5,
+      "circularity": 0.6165925978423202,
+      "solidity": 0.8763636363636363,
+      "aspect": 1.8,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 134.0,
+      "circularity": 0.5126224764007636,
+      "solidity": 0.9178082191780822,
+      "aspect": 2.75,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 125.5,
+      "circularity": 0.5498340929838641,
+      "solidity": 0.8932384341637011,
+      "aspect": 2.2222222222222223,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 153.5,
+      "circularity": 0.437704745886106,
+      "solidity": 0.8457300275482094,
+      "aspect": 3.0,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 97.5,
+      "circularity": 0.6458200859891107,
+      "solidity": 0.8705357142857143,
+      "aspect": 1.7,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 107.0,
+      "circularity": 0.609455667731836,
+      "solidity": 0.8629032258064516,
+      "aspect": 1.7,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 91.0,
+      "circularity": 0.6976810634906855,
+      "solidity": 0.9629629629629629,
+      "aspect": 2.0,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 138.0,
+      "circularity": 0.4929226745976971,
+      "solidity": 0.8706624605678234,
+      "aspect": 2.4444444444444446,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.75,
+      "area": 133.5,
+      "circularity": 0.5435302706119383,
+      "solidity": 0.8754098360655738,
+      "aspect": 1.9,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.7424000000000001,
+      "area": 884.0,
+      "circularity": 0.5254742357715768,
+      "solidity": 0.8076747373229786,
+      "aspect": 0.68,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.722,
+      "area": 107.0,
+      "circularity": 0.5801535339327207,
+      "solidity": 0.8770491803278688,
+      "aspect": 1.6,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.722,
+      "area": 113.0,
+      "circularity": 0.6343286561922232,
+      "solidity": 0.9076305220883534,
+      "aspect": 1.6,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.71,
+      "area": 95.5,
+      "circularity": 0.6573394460344392,
+      "solidity": 0.880184331797235,
+      "aspect": 1.5,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.7018181818181818,
+      "area": 129.0,
+      "circularity": 0.6759730662001461,
+      "solidity": 0.8989547038327527,
+      "aspect": 1.5454545454545454,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.65,
+      "area": 188.0,
+      "circularity": 0.46904144489336475,
+      "solidity": 0.8663594470046083,
+      "aspect": 2.7,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.65,
+      "area": 189.0,
+      "circularity": 0.4607178127724963,
+      "solidity": 0.8552036199095022,
+      "aspect": 2.8,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.65,
+      "area": 175.5,
+      "circularity": 0.43071563667721857,
+      "solidity": 0.8775,
+      "aspect": 3.0,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.65,
+      "area": 183.5,
+      "circularity": 0.46546653979622143,
+      "solidity": 0.8534883720930233,
+      "aspect": 2.7,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.65,
+      "area": 122.5,
+      "circularity": 0.478357078336916,
+      "solidity": 0.8812949640287769,
+      "aspect": 2.75,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.65,
+      "area": 168.0,
+      "circularity": 0.50013343921792,
+      "solidity": 0.8795811518324608,
+      "aspect": 2.4,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.65,
+      "area": 159.5,
+      "circularity": 0.4501480284749769,
+      "solidity": 0.8763736263736264,
+      "aspect": 2.7777777777777777,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.65,
+      "area": 164.0,
+      "circularity": 0.6942171180339165,
+      "solidity": 0.967551622418879,
+      "aspect": 2.1,
+      "source": "shape"
+    },
+    {
+      "category": "valve",
+      "confidence": 0.65,
+      "area": 163.0,
+      "circularity": 0.4520541239342347,
+      "solidity": 0.8647214854111406,
+      "aspect": 3.0,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 32331.0,
+      "circularity": 0.3524890505710594,
+      "solidity": 0.984230874608055,
+      "aspect": 0.5403225806451613,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 3423.0,
+      "circularity": 0.3291463740654676,
+      "solidity": 0.8090285984400851,
+      "aspect": 1.00990099009901,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 196.0,
+      "circularity": 0.42868580504393133,
+      "solidity": 0.875,
+      "aspect": 3.3333333333333335,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 206.5,
+      "circularity": 0.4689880775729494,
+      "solidity": 0.8658280922431866,
+      "aspect": 3.1,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 231.5,
+      "circularity": 0.433708979744765,
+      "solidity": 0.8819047619047619,
+      "aspect": 3.3,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 261.5,
+      "circularity": 0.3677651926577944,
+      "solidity": 0.8070987654320988,
+      "aspect": 3.272727272727273,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 193.0,
+      "circularity": 0.451228787013396,
+      "solidity": 0.8997668997668997,
+      "aspect": 3.3333333333333335,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 154.5,
+      "circularity": 0.391905071619165,
+      "solidity": 0.8631284916201117,
+      "aspect": 3.5,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 158.0,
+      "circularity": 0.39419440581463633,
+      "solidity": 0.8207792207792208,
+      "aspect": 3.111111111111111,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 159.0,
+      "circularity": 0.40611499180534055,
+      "solidity": 0.8390501319261213,
+      "aspect": 3.111111111111111,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.65,
+      "area": 191.0,
+      "circularity": 0.4611744569071048,
+      "solidity": 0.8967136150234741,
+      "aspect": 3.3333333333333335,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.6225017892770898,
+      "area": 42.0,
+      "circularity": 0.6900071571083589,
+      "solidity": 1.0,
+      "aspect": 0.4166666666666667,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.5889965252860037,
+      "area": 3635.5,
+      "circularity": 0.5601652871587648,
+      "solidity": 0.9930346899754166,
+      "aspect": 3.125,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.5537971737397159,
+      "area": 138.0,
+      "circularity": 0.4740122243706287,
+      "solidity": 0.9019607843137255,
+      "aspect": 3.125,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.5509847269300586,
+      "area": 192.5,
+      "circularity": 0.46168538659347375,
+      "solidity": 0.903755868544601,
+      "aspect": 3.3333333333333335,
+      "source": "shape"
+    },
+    {
+      "category": "pump",
+      "confidence": 0.5509336729565677,
+      "area": 167.0,
+      "circularity": 0.4679058148209232,
+      "solidity": 0.893048128342246,
+      "aspect": 3.111111111111111,
       "source": "shape"
     },
     {
       "category": "motor",
-      "confidence": 0.7043335704562532,
-      "area": 82.0,
-      "circularity": 0.7266673441607235,
+      "confidence": 0.7464471322553297,
+      "area": 106.0,
+      "circularity": 0.8469918064437989,
       "solidity": 1.0,
-      "aspect": 0.4666666666666667,
+      "aspect": 1.3,
       "source": "shape"
     },
     {
       "category": "motor",
-      "confidence": 0.7043335704562532,
-      "area": 82.0,
-      "circularity": 0.7266673441607235,
+      "confidence": 0.7352697715068442,
+      "area": 65.0,
+      "circularity": 0.815056490019555,
+      "solidity": 0.9701492537313433,
+      "aspect": 1.1111111111111112,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.734768533379303,
+      "area": 191.5,
+      "circularity": 0.8136243810837228,
+      "solidity": 0.9720812182741116,
+      "aspect": 0.65,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.7302228355712548,
+      "area": 1006.0,
+      "circularity": 0.800636673060728,
       "solidity": 1.0,
-      "aspect": 0.4666666666666667,
+      "aspect": 0.7837837837837838,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.7292082637050654,
+      "area": 166.5,
+      "circularity": 0.797737896300187,
+      "solidity": 0.9794117647058823,
+      "aspect": 1.0,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.7271137039932404,
+      "area": 65.5,
+      "circularity": 0.7917534399806868,
+      "solidity": 0.9703703703703703,
+      "aspect": 1.1111111111111112,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.7256698154543738,
+      "area": 71.0,
+      "circularity": 0.7876280441553538,
+      "solidity": 0.9793103448275862,
+      "aspect": 1.5,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.7231380796773872,
+      "area": 172.0,
+      "circularity": 0.7803945133639634,
+      "solidity": 0.98005698005698,
+      "aspect": 1.0625,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.7104946481120142,
+      "area": 240.0,
+      "circularity": 0.7442704231771836,
+      "solidity": 1.0,
+      "aspect": 0.5217391304347826,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.7097498697058954,
+      "area": 135.5,
+      "circularity": 0.7421424848739868,
+      "solidity": 0.9926739926739927,
+      "aspect": 2.111111111111111,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.7045118667016551,
+      "area": 175.5,
+      "circularity": 0.7271767620047289,
+      "solidity": 0.9971590909090909,
+      "aspect": 2.1,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.6974213782217253,
+      "area": 322.0,
+      "circularity": 0.7069182234906438,
+      "solidity": 1.0,
+      "aspect": 0.4642857142857143,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.6973890361081129,
+      "area": 118.5,
+      "circularity": 0.706825817451751,
+      "solidity": 0.9957983193277311,
+      "aspect": 2.375,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.6968606119493332,
+      "area": 117.0,
+      "circularity": 0.7053160341409522,
+      "solidity": 1.0,
+      "aspect": 2.25,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.69013134395625,
+      "area": 124.0,
+      "circularity": 0.6860895541607142,
+      "solidity": 1.0,
+      "aspect": 2.375,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.6876084008012763,
+      "area": 127.0,
+      "circularity": 0.6788811451465037,
+      "solidity": 0.996078431372549,
+      "aspect": 2.5,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.6836634574083995,
+      "area": 131.0,
+      "circularity": 0.6676098783097131,
+      "solidity": 1.0,
+      "aspect": 2.5,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.6836634574083995,
+      "area": 131.0,
+      "circularity": 0.6676098783097131,
+      "solidity": 1.0,
+      "aspect": 2.5,
+      "source": "shape"
+    },
+    {
+      "category": "motor",
+      "confidence": 0.6756330757017525,
+      "area": 129.5,
+      "circularity": 0.6446659305764356,
+      "solidity": 0.9923371647509579,
+      "aspect": 2.5,
       "source": "shape"
     }
   ]

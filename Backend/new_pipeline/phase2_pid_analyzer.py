@@ -96,6 +96,7 @@ class PIDImageAnalyzer:
             # Re-enable AI models for enhancement
             florence_future = executor.submit(self._florence_analysis, image)
             dino_future = executor.submit(self._grounding_dino_analysis, image)
+            # Gemini will be called after old pipeline results are available
             
             # Collect results with timing
             opencv_start = time.time()
@@ -122,73 +123,119 @@ class PIDImageAnalyzer:
             dino_results = dino_future.result()
             dino_time = time.time() - dino_start
             print(f"  - Grounding DINO analysis completed in {dino_time:.2f}s, detected {dino_results.get('total_detections', 0)} components (refinement)")
-        
-        total_parallel_time = time.time() - start_time
-        print(f"Parallel analysis completed in {total_parallel_time:.2f}s")
-        
-        # Use old pipeline's accurate results as primary, AI models for enhancement
-        if old_pipeline_results:
-            print(f"Old pipeline detected components: {old_pipeline_results.get('counts', {})}")
-            print(f"DEBUG: Old pipeline result keys: {old_pipeline_results.keys()}")
-            print(f"DEBUG: Old pipeline detections structure: {old_pipeline_results.get('detections', [])[:2] if old_pipeline_results.get('detections') else 'No detections'}")
-            # Convert old pipeline results to expected format
-            dino_boxes = []
-            dino_confidences = []
-            dino_labels = []
             
-            for component in old_pipeline_results.get('detections', []):
-                bbox = component.get('bbox', [])
-                if len(bbox) == 4:
-                    x, y, w, h = bbox
-                    dino_boxes.append([x, y, x+w, y+h])  # Convert to xyxy format
-                    dino_confidences.append(component.get('confidence', 0.5))
-                    # Try multiple possible label fields
-                    label = component.get('label', component.get('category', component.get('type', 'unknown')))
-                    dino_labels.append(label)
-                    print(f"DEBUG: Extracted component - label: {label}, confidence: {component.get('confidence', 0.5)}, bbox: {bbox}")
+            # Compile a list of candidate detections before running Gemini verification
+            candidate_detections = []
             
-            # Enhance with Grounding DINO results (only non-overlapping high-confidence)
+            # 1. Add old pipeline detections
+            if old_pipeline_results and old_pipeline_results.get('detections'):
+                for det in old_pipeline_results['detections']:
+                    bbox = det.get('bbox', [])
+                    if len(bbox) == 4:
+                        x, y, w, h = bbox
+                        # Old pipeline bbox format is (x, y, w, h). Convert to [x1, y1, x2, y2]
+                        xyxy = [x, y, x + w, y + h]
+                        # Prioritize category/label
+                        label = det.get('category', det.get('label', det.get('name', 'unknown'))).lower()
+                        candidate_detections.append({
+                            'bbox': xyxy,
+                            'label': label,
+                            'confidence': det.get('confidence', 0.5),
+                            'source': 'old_pipeline'
+                        })
+                        
+            # 2. Add Grounding DINO detections (only non-overlapping with existing)
             for box, conf, label in zip(dino_results['boxes'], dino_results['confidences'], dino_results['labels']):
+                label_clean = self._improve_label_classification(label, box).lower()
                 overlaps = False
-                for existing_box in dino_boxes:
-                    iou = calculate_iou(box, existing_box)
-                    if iou > 0.3:
+                for existing in candidate_detections:
+                    if calculate_iou(box, existing['bbox']) > 0.15:
                         overlaps = True
                         break
-                if not overlaps and conf > 0.5:
-                    dino_boxes.append(box)
-                    dino_confidences.append(conf)
-                    dino_labels.append(label)
-            
-            # Enhance with Florence-2 results (only non-overlapping)
+                if not overlaps:
+                    candidate_detections.append({
+                        'bbox': box,
+                        'label': label_clean,
+                        'confidence': conf,
+                        'source': 'dino'
+                    })
+                    
+            # 3. Add Florence-2 detections (only non-overlapping)
             for box, label in zip(florence_results.get('bboxes', []), florence_results.get('labels', [])):
                 if len(box) == 4:
                     overlaps = False
-                    for existing_box in dino_boxes:
-                        iou = calculate_iou(box, existing_box)
-                        if iou > 0.3:
+                    for existing in candidate_detections:
+                        if calculate_iou(box, existing['bbox']) > 0.15:
                             overlaps = True
                             break
                     if not overlaps:
-                        dino_boxes.append(box)
-                        dino_confidences.append(0.5)
-                        dino_labels.append(label)
+                        candidate_detections.append({
+                            'bbox': box,
+                            'label': label.lower(),
+                            'confidence': 0.5,
+                            'source': 'florence'
+                        })
             
+            # Call Gemini after combining all detections for final verification
+            gemini_start = time.time()
+            gemini_results = self._gemini_analysis(image, candidate_detections)
+            gemini_time = time.time() - gemini_start
+            print(f"  - Gemini verification completed in {gemini_time:.2f}s, verified {gemini_results.get('total_verified', 0)} components, used {gemini_results.get('total_tokens', 0)} tokens")
+            
+            # Map Gemini verification results back to candidate detections
+            verified_candidates = []
+            for det in candidate_detections:
+                bbox = det['bbox']
+                gemini_label = None
+                gemini_conf = 0.5
+                for verification in gemini_results.get('verified_detections', []):
+                    if calculate_iou(bbox, verification.get('bbox', [])) > 0.6:
+                        gemini_label = verification.get('label')
+                        gemini_conf = verification.get('confidence', 0.8)
+                        break
+                
+                # Trust the original expert models unless there's a strong reason not to
+                final_label = det['label']
+                final_conf = det['confidence']
+                
+                if gemini_label and gemini_label != 'unknown':
+                    if det['label'] == 'unknown':
+                        final_label = gemini_label
+                        final_conf = gemini_conf
+                    elif gemini_label == 'other':
+                        # Only reject if detection confidence is relatively low
+                        if det['confidence'] < 0.40:
+                            final_label = 'other'
+                            final_conf = gemini_conf
+                    else:
+                        # If Gemini suggests a different category, trust the expert source for physical shapes
+                        if det['label'] in ['valve', 'pump', 'motor', 'tank']:
+                            # Keep expert label
+                            final_label = det['label']
+                        else:
+                            final_label = gemini_label
+                            final_conf = gemini_conf
+                
+                if final_label != det['label']:
+                    print(f"DEBUG: Gemini updated label from {det['label']} to {final_label} for box {bbox}")
+                
+                verified_candidates.append({
+                    'bbox': bbox,
+                    'label': final_label,
+                    'confidence': final_conf,
+                    'source': det['source']
+                })
+            
+            # Prepare dino_results dict for the heuristic engine
             dino_results = {
-                'boxes': dino_boxes,
-                'confidences': dino_confidences,
-                'labels': dino_labels,
-                'total_detections': len(dino_boxes)
-            }
-        else:
-            # Fallback to AI models only
-            dino_results = {
-                'boxes': dino_results['boxes'],
-                'confidences': dino_results['confidences'],
-                'labels': dino_results['labels'],
-                'total_detections': dino_results['total_detections']
+                'boxes': [det['bbox'] for det in verified_candidates],
+                'confidences': [det['confidence'] for det in verified_candidates],
+                'labels': [det['label'] for det in verified_candidates],
+                'total_detections': len(verified_candidates)
             }
         
+        total_parallel_time = time.time() - start_time
+        print(f"Parallel analysis completed in {total_parallel_time:.2f}s")
         print(f"Combined detection (old pipeline primary + AI enhancement): {len(dino_results['boxes'])} components")
         
         print("Parallel analysis complete. Running heuristic engine...")
@@ -490,7 +537,7 @@ class PIDImageAnalyzer:
                 pil_image = pil_image.resize(new_size, Image.BILINEAR)  # BILINEAR for better quality
             
             # Use CAPTION_TO_PHRASE_GROUNDING task for better P&ID detection
-            prompt = "tank valve pump"
+            prompt = "tank valve pump instrument"
             inputs = self.florence_processor(text=prompt, images=pil_image, return_tensors="pt").to(FLORENCE_DEVICE)
             generated_ids = self.florence_model.generate(
                 input_ids=inputs["input_ids"],
@@ -553,11 +600,12 @@ class PIDImageAnalyzer:
             ])
             image_tensor, _ = transform(image_pil, None)
             
-            # Use focused prompts for P&ID components only (tank, valve, pump)
+            # Use focused prompts for P&ID components with optimized thresholds for maximum recall
             prompts_config = [
                 {"prompt": "tank", "box_threshold": 0.30, "text_threshold": 0.25},
-                {"prompt": "valve", "box_threshold": 0.30, "text_threshold": 0.25},
-                {"prompt": "pump", "box_threshold": 0.30, "text_threshold": 0.25}
+                {"prompt": "valve", "box_threshold": 0.25, "text_threshold": 0.20},
+                {"prompt": "pump", "box_threshold": 0.25, "text_threshold": 0.20},
+                {"prompt": "instrument sensor bubble gauge meter circular tag", "box_threshold": 0.22, "text_threshold": 0.18}
             ]
             
             all_boxes = []
@@ -616,6 +664,8 @@ class PIDImageAnalyzer:
                         all_boxes.append([x1, y1, x2, y2])
                         all_confidences.append(float(logit))
                         all_labels.append(phrase)
+            except Exception as e:
+                print(f"Grounding DINO detection error: {e}")
             finally:
                 # Clean up cached features to release memory
                 if hasattr(self.grounding_model, 'features'):
@@ -654,6 +704,141 @@ class PIDImageAnalyzer:
                 'confidences': [],
                 'labels': [],
                 'total_detections': 0
+            }
+    
+    def _gemini_analysis(self, image: np.ndarray, detections: List[Dict] = None) -> Dict[str, Any]:
+        """Gemini analysis: final verification of detected components using gemini-2.5-flash and parallel cropped images"""
+        print("  - Running Gemini final verification...")
+        
+        try:
+            if detections is None or len(detections) == 0:
+                print("Gemini: No detections to verify")
+                return {
+                    'verified_detections': [],
+                    'total_verified': 0,
+                    'total_tokens': 0
+                }
+            
+            import base64
+            import io
+            from PIL import Image as PILImage
+            from concurrent.futures import ThreadPoolExecutor
+            
+            def verify_single(detection):
+                bbox = detection.get('bbox', [])
+                current_label = detection.get('label', 'unknown').lower()
+                if len(bbox) != 4:
+                    return None
+                    
+                x1, y1, x2, y2 = bbox
+                h_img, w_img = image.shape[:2]
+                
+                # Make sure coordinates are in bounds
+                x1_p = max(0, min(int(x1), w_img - 1))
+                y1_p = max(0, min(int(y1), h_img - 1))
+                x2_p = max(0, min(int(x2), w_img))
+                y2_p = max(0, min(int(y2), h_img))
+                
+                if x2_p <= x1_p or y2_p <= y1_p:
+                    return None
+                    
+                # Calculate padding (ensure minimum crop size of 160x160)
+                w_box = x2_p - x1_p
+                h_box = y2_p - y1_p
+                
+                target_crop_w = max(160, int(w_box * 1.5))
+                target_crop_h = max(160, int(h_box * 1.5))
+                
+                pad_w = max(10, (target_crop_w - w_box) // 2)
+                pad_h = max(10, (target_crop_h - h_box) // 2)
+                
+                crop_x1 = max(0, x1_p - pad_w)
+                crop_y1 = max(0, y1_p - pad_h)
+                crop_x2 = min(w_img, x2_p + pad_w)
+                crop_y2 = min(h_img, y2_p + pad_h)
+                
+                cropped_img = image[crop_y1:crop_y2, crop_x1:crop_x2]
+                if cropped_img.size == 0:
+                    return None
+                    
+                # Convert to base64
+                pil_crop = PILImage.fromarray(cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB))
+                
+                # Resize if crop is too large
+                if max(pil_crop.size) > 300:
+                    scale = 300 / max(pil_crop.size)
+                    pil_crop = pil_crop.resize((int(pil_crop.size[0] * scale), int(pil_crop.size[1] * scale)), PILImage.BILINEAR)
+                    
+                buffered = io.BytesIO()
+                pil_crop.save(buffered, format="JPEG")
+                crop_str = base64.b64encode(buffered.getvalue()).decode()
+                
+                prompt = f"""
+                Verify the P&ID diagram component centered in this cropped image.
+                Suggested classification: {current_label}
+                
+                Is this classification correct? Answer YES or NO.
+                If NO, provide the correct classification from: tank, valve, pump, motor, instrument, or other.
+                """
+                
+                try:
+                    response = self.gemini_client.generate_content(
+                        [prompt, {"mime_type": "image/jpeg", "data": crop_str}],
+                        generation_config={"temperature": GEMINI_TEMPERATURE}
+                    )
+                    
+                    if response and response.text:
+                        response_text = response.text.strip().lower()
+                        verified_label = current_label
+                        
+                        # Parse response: if Gemini says "no", extract the new correct label
+                        if 'no' in response_text:
+                            for option in ['valve', 'tank', 'pump', 'motor', 'instrument', 'other']:
+                                if option in response_text:
+                                    verified_label = option
+                                    break
+                                
+                        print(f"DEBUG: Gemini verification response: '{response_text.strip()}' -> final label: '{verified_label}' (suggested: '{current_label}')")
+                        
+                        tokens = 0
+                        if hasattr(response, 'usage_metadata'):
+                            tokens = response.usage_metadata.total_token_count if hasattr(response.usage_metadata, 'total_token_count') else 0
+                            
+                        return {
+                            'bbox': bbox,
+                            'label': verified_label,
+                            'confidence': 0.85 if verified_label == current_label else 0.75,
+                            'verified': True,
+                            'tokens': tokens
+                        }
+                except Exception as e:
+                    print(f"DEBUG: Gemini verification failed for component {current_label}: {e}")
+                    
+                return None
+            
+            verified_detections = []
+            total_tokens = 0
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(verify_single, det) for det in detections[:35]]
+                for future in futures:
+                    res = future.result()
+                    if res is not None:
+                        verified_detections.append(res)
+                        total_tokens += res.get('tokens', 0)
+                        
+            print(f"Gemini verified {len(verified_detections)} components, total tokens used: {total_tokens}")
+            return {
+                'verified_detections': verified_detections,
+                'total_verified': len(verified_detections),
+                'total_tokens': total_tokens
+            }
+        except Exception as e:
+            print(f"Gemini verification error: {e}")
+            print("WARNING: Gemini verification failed, continuing without verification")
+            return {
+                'verified_detections': [],
+                'total_verified': 0,
+                'total_tokens': 0
             }
     
     def _heuristic_engine(self, opencv_results: Dict, ocr_results: Dict, 
@@ -708,7 +893,7 @@ class PIDImageAnalyzer:
             #             print(f"DEBUG: Component validated via library: {detection['label']}")
             #             continue
             
-            if self._validate_component(detection):
+            if self._validate_component(detection, image.shape if image is not None else None):
                 validated_components.append(detection)
                 print(f"DEBUG: Component validated: {detection['label']}")
             else:
@@ -751,38 +936,37 @@ class PIDImageAnalyzer:
         
         return has_valid_prefix and has_number
     
-    def _validate_component(self, detection: Dict) -> bool:
+    def _validate_component(self, detection: Dict, image_shape: Tuple[int, int] = None) -> bool:
         """Validate component detection with fine-tuned thresholds for maximum accuracy"""
         label = detection.get('label', '').lower()
         confidence = detection.get('confidence', 0)
         
-        # Fine-tuned component-specific confidence thresholds for maximum recall
+        # Validate component characteristics (size, aspect ratio)
+        if not self._validate_component_characteristics(detection.get('bbox', []), label, image_shape):
+            return False
+            
+        # Component-specific confidence thresholds to prevent false positives and overcounting
         if label == 'motor':
-            # Lowered threshold for motors
-            if confidence < 0.25:
+            if confidence < 0.35:
                 return False
         elif label == 'tank':
-            # Lowered threshold for tanks
-            if confidence < 0.25:
+            if confidence < 0.35:
                 return False
         elif label == 'pump':
-            # Lowered threshold for pumps
-            if confidence < 0.25:
+            if confidence < 0.35:
                 return False
         elif label == 'valve':
-            # Lowered threshold for valves
-            if confidence < 0.15:
+            if confidence < 0.25:
                 return False
-        elif label == 'instrument':
-            # Lowered threshold for instruments
-            if confidence < 0.20:
+        elif label in ['instrument', 'sensor', 'controller', 'transmitter', 'indicator', 'gauge']:
+            if confidence < 0.30:
                 return False
         else:
             # Default threshold for other components
-            if confidence < 0.20:
+            if confidence < 0.30:
                 return False
         
-        # Strict label validation
+        # Strict label validation - expanded to include more instrument types
         valid_labels = ['pump', 'valve', 'vessel', 'motor', 'pipe', 'tank', 'sensor', 'controller', 'transmitter', 'indicator', 'gauge', 'instrument', 'component']
         
         # Require exact label match
@@ -805,18 +989,18 @@ class PIDImageAnalyzer:
             improved_label = self._improve_label_classification(label, box)
             print(f"DEBUG: Improved label: {improved_label}")
             
-            # Apply component-specific confidence check (lowered for recall)
-            label_threshold = 0.20  # Default
+            # Apply component-specific confidence check to prevent false positives and overcounting
+            label_threshold = 0.30  # Default
             if improved_label == 'motor':
-                label_threshold = 0.25  # Lowered for motors
+                label_threshold = 0.35
             elif improved_label == 'tank':
-                label_threshold = 0.20  # Lowered for tanks
+                label_threshold = 0.35
             elif improved_label == 'pump':
-                label_threshold = 0.25  # Lowered for pumps
+                label_threshold = 0.35
             elif improved_label == 'valve':
-                label_threshold = 0.15  # Lowered for valves
+                label_threshold = 0.25
             elif improved_label == 'instrument':
-                label_threshold = 0.20  # Lowered for instruments
+                label_threshold = 0.30
             
             if conf < label_threshold:
                 print(f"DEBUG: Component failed confidence check ({conf} < {label_threshold})")
@@ -892,8 +1076,8 @@ class PIDImageAnalyzer:
         
         return detection
     
-    def _validate_component_characteristics(self, bbox: List, label: str) -> bool:
-        """Validate component based on visual characteristics (handles normalized coordinates)"""
+    def _validate_component_characteristics(self, bbox: List, label: str, image_shape: Tuple[int, int] = None) -> bool:
+        """Validate component based on visual characteristics and relative size constraints"""
         if len(bbox) != 4:
             return False
             
@@ -920,6 +1104,28 @@ class PIDImageAnalyzer:
             return False
         if aspect_ratio < 0.1 or aspect_ratio > 10.0:  # Very wide range
             return False
+            
+        # Check size relative to image size if available
+        if image_shape is not None:
+            img_h, img_w = image_shape[:2]
+            rel_w = width / img_w
+            rel_h = height / img_h
+            
+            # Instruments and valves must be small
+            if any(k in label_lower for k in ['instrument', 'sensor', 'tag', 'controller', 'transmitter', 'indicator', 'gauge']):
+                if rel_w > 0.18 or rel_h > 0.18:
+                    return False
+            elif 'valve' in label_lower:
+                if rel_w > 0.18 or rel_h > 0.18:
+                    return False
+            # Pumps and motors must be small to medium
+            elif any(k in label_lower for k in ['pump', 'motor']):
+                if rel_w > 0.30 or rel_h > 0.30:
+                    return False
+            # Vessels/tanks can be larger, but should not span almost the entire image
+            elif any(k in label_lower for k in ['tank', 'vessel', 'reactor']):
+                if rel_w > 0.90 or rel_h > 0.90:
+                    return False
             
         return True
     
@@ -959,8 +1165,9 @@ class PIDImageAnalyzer:
             return 'motor'
         
         # Instrument detection (comprehensive list)
-        instrument_keywords = ['sensor', 'transmitter', 'indicator', 'gauge', 'controller', 'instrument', 
-                             'pressure transmitter', 'temperature transmitter', 'flow indicator', 'level gauge']
+        instrument_keywords = ['sensor', 'transmitter', 'indicator', 'gauge', 'instrument', 
+                             'pressure transmitter', 'temperature transmitter', 'flow indicator', 'level gauge',
+                             'bubble', 'meter', 'circular tag', 'dial', 'circle']
         for keyword in instrument_keywords:
             if keyword in label_lower:
                 return 'instrument'
