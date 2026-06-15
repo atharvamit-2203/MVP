@@ -256,33 +256,33 @@ CONF_THRESH: dict[str, float] = {
 # Higher confidence thresholds for fast mode to reduce false positives
 # Balanced to maintain accuracy while being fast
 FAST_CONF_THRESH: dict[str, float] = {
-	"motor": 0.35,
-	"pump": 0.40,  # Reduced from 0.50 to improve pump detection
-	"tank": 0.30,
-	"valve": 0.40,
-	"instrument": 0.30,
-	"other": 0.35,
+	"motor": 0.30,
+	"pump": 0.35,  # Reduced from 0.40 to improve pump detection
+	"tank": 0.25,
+	"valve": 0.25,
+	"instrument": 0.25,
+	"other": 0.30,
 }
 
 # Confidence thresholds for simple P&ID diagrams (clear, uncluttered layouts)
-# Balanced thresholds to avoid filtering out valid detections
+# Increased thresholds to reduce overcounting of tanks and valves
 SIMPLE_CONF_THRESH: dict[str, float] = {
-	"motor": 0.30,  # Lowered to allow valid motor detections
-	"pump": 0.35,  # Lowered to allow valid pump detections
-	"tank": 0.30,  # Lowered to allow valid tank detections
-	"valve": 0.25,  # Lowered to allow valid valve detections
-	"instrument": 0.30,  # Lowered to allow valid instrument detections
+	"motor": 0.30,
+	"pump": 0.35,
+	"tank": 0.25,
+	"valve": 0.25,
+	"instrument": 0.30,
 	"other": 0.30,
 }
 
 # Confidence thresholds for complex P&ID diagrams (dense, overlapping elements)
-# Tightened to reduce valve overcounting while maintaining reasonable recall
+# Tightened to reduce overcounting while maintaining reasonable recall
 COMPLEX_CONF_THRESH: dict[str, float] = {
-	"motor": 0.25,  # Increased to reduce false positives
-	"pump": 0.25,  # Increased to reduce false positives
-	"tank": 0.20,  # Increased to reduce false positives
-	"valve": 0.35,  # Significantly increased to reduce valve overcounting
-	"instrument": 0.20,  # Increased to reduce false positives
+	"motor": 0.25,
+	"pump": 0.25,
+	"tank": 0.20,
+	"valve": 0.20,
+	"instrument": 0.25,
 	"other": 0.30,
 }
 
@@ -478,7 +478,7 @@ def apply_simple_diagram_validation(
 			continue
 		
 		# For all diagrams, require minimum confidence to avoid false positives
-		min_conf = 0.20  # Lowered to allow valid detections
+		min_conf = 0.35  # Increased to reduce overcounting in simple diagrams
 		if confidence < min_conf:
 			continue
 		
@@ -4318,15 +4318,35 @@ async def analyze_pid_image_async(
 			circularity = float(det.get("circularity", 0.0))
 			solidity = float(det.get("solidity", 0.0))
 			
-			# Verify geometry matches category expectations - relaxed thresholds
+			# Verify geometry matches category expectations - stricter for both simple and complex diagrams
 			if category == "tank":
-				# Tanks should have reasonable area - relaxed aspect ratio and solidity requirements
-				if area >= 80:
-					verified_components.append(det)
+				# Tanks should have reasonable area - stricter requirements for both diagram types
+				if diagram_complexity == "simple":
+					min_area = 300  # Increased for simple diagrams
+					min_solidity = 0.50
+					if area >= min_area and solidity >= min_solidity:
+						verified_components.append(det)
+				else:
+					# Tightened for complex diagrams to reduce overcounting
+					min_area = 200  # Increased from 80
+					min_solidity = 0.45  # Added solidity requirement
+					if area >= min_area and solidity >= min_solidity:
+						verified_components.append(det)
 			elif category == "valve":
-				# Valves should be compact - relaxed circularity requirements
-				if area >= 10 and area <= 10000 and circularity >= 0.15:
-					verified_components.append(det)
+				# Valves should be compact - stricter requirements for both diagram types
+				if diagram_complexity == "simple":
+					min_area = 80  # Increased for simple diagrams
+					min_circularity = 0.30  # Increased for simple diagrams
+					max_area = 5000
+					if area >= min_area and area <= max_area and circularity >= min_circularity:
+						verified_components.append(det)
+				else:
+					# Tightened for complex diagrams to reduce overcounting
+					min_area = 50  # Increased from 10
+					min_circularity = 0.25  # Increased from 0.15
+					max_area = 8000  # Reduced from 10000
+					if area >= min_area and area <= max_area and circularity >= min_circularity:
+						verified_components.append(det)
 			elif category in ["motor", "pump"]:
 				# Motors and pumps should have reasonable size and circularity
 				# Relaxed thresholds to catch more components, especially from component library

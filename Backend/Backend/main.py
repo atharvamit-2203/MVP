@@ -503,6 +503,24 @@ def _extract_component_labels(raw_name: str) -> list[str]:
 def _persist_component_library_samples(components: list[ComponentData]) -> int:
 	active_learning.ANNOTATIONS_DIR.mkdir(parents=True, exist_ok=True)
 	ann_path = active_learning.ANNOTATIONS_DIR / "annotations.jsonl"
+	
+	# Load existing annotations to check for duplicates
+	existing_hashes = set()
+	if ann_path.exists():
+		with open(ann_path, "r", encoding="utf-8") as fh:
+			for line in fh:
+				try:
+					entry = json.loads(line)
+					image_name = entry.get("image")
+					if image_name:
+						# Compute hash of existing image
+						image_path = active_learning.ANNOTATIONS_DIR / image_name
+						if image_path.exists():
+							with open(image_path, "rb") as img_fh:
+								existing_hashes.add(hash(img_fh.read()))
+				except Exception:
+					continue
+	
 	saved = 0
 
 	for component in components:
@@ -513,6 +531,12 @@ def _persist_component_library_samples(components: list[ComponentData]) -> int:
 		try:
 			image_bytes = base64.b64decode(component.file_data)
 		except Exception:
+			continue
+
+		# Check for duplicate by content hash
+		image_hash = hash(image_bytes)
+		if image_hash in existing_hashes:
+			logger.info(f"Skipping duplicate component: {name}")
 			continue
 
 		image_array = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -545,6 +569,7 @@ def _persist_component_library_samples(components: list[ComponentData]) -> int:
 		with open(ann_path, "a", encoding="utf-8") as fh:
 			fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 		saved += 1
+		existing_hashes.add(image_hash)
 		logger.info(f"Saved annotation for {image_name} with labels {labels}")
 
 	if saved > 0:
