@@ -4,6 +4,7 @@ Analyzes P&ID images using parallel processing with OpenCV, Tesseract OCR, Flore
 """
 import cv2
 import numpy as np
+import math
 from pathlib import Path
 from typing import List, Dict, Tuple, Any
 import json
@@ -17,6 +18,7 @@ import pytesseract
 # Configure Tesseract path
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 import google.generativeai as genai
+from openai import OpenAI
 from new_pipeline.config import *
 from new_pipeline.utils import *
 
@@ -35,6 +37,7 @@ class PIDImageAnalyzer:
         self.grounding_model = None
         self.ocr_engine = None
         self.gemini_client = None
+        self.openai_client = None
         self._load_models()
     
     def _load_models(self):
@@ -59,6 +62,14 @@ class PIDImageAnalyzer:
         print("Initializing Gemini...")
         genai.configure(api_key=GEMINI_API_KEY)
         self.gemini_client = genai.GenerativeModel(GEMINI_MODEL)
+        
+        # Initialize OpenAI client as fallback
+        if OPENAI_API_KEY:
+            print("Initializing OpenAI client as fallback...")
+            self.openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        else:
+            print("WARNING: OPENAI_API_KEY not found, OpenAI fallback will not be available")
+            self.openai_client = None
         
         print("All models loaded successfully!")
     
@@ -182,42 +193,28 @@ class PIDImageAnalyzer:
             gemini_time = time.time() - gemini_start
             print(f"  - Gemini verification completed in {gemini_time:.2f}s, verified {gemini_results.get('total_verified', 0)} components, used {gemini_results.get('total_tokens', 0)} tokens")
             
-            # Map Gemini verification results back to candidate detections
+            # Map verification results back to candidate detections
+            # Use AI verification when available, fall back to expert models if verification fails
             verified_candidates = []
             for det in candidate_detections:
                 bbox = det['bbox']
-                gemini_label = None
-                gemini_conf = 0.5
+                verification_result = None
                 for verification in gemini_results.get('verified_detections', []):
                     if calculate_iou(bbox, verification.get('bbox', [])) > 0.6:
-                        gemini_label = verification.get('label')
-                        gemini_conf = verification.get('confidence', 0.8)
+                        verification_result = verification
                         break
                 
-                # Trust the original expert models unless there's a strong reason not to
-                final_label = det['label']
-                final_conf = det['confidence']
-                
-                if gemini_label and gemini_label != 'unknown':
-                    if det['label'] == 'unknown':
-                        final_label = gemini_label
-                        final_conf = gemini_conf
-                    elif gemini_label == 'other':
-                        # Only reject if detection confidence is relatively low
-                        if det['confidence'] < 0.40:
-                            final_label = 'other'
-                            final_conf = gemini_conf
-                    else:
-                        # If Gemini suggests a different category, trust the expert source for physical shapes
-                        if det['label'] in ['valve', 'pump', 'motor', 'tank']:
-                            # Keep expert label
-                            final_label = det['label']
-                        else:
-                            final_label = gemini_label
-                            final_conf = gemini_conf
-                
-                if final_label != det['label']:
-                    print(f"DEBUG: Gemini updated label from {det['label']} to {final_label} for box {bbox}")
+                # Use verified label if available, otherwise fall back to expert model
+                if verification_result is not None:
+                    # AI verification succeeded - use verified result
+                    final_label = verification_result.get('label', det['label'])
+                    final_conf = verification_result.get('confidence', det['confidence'])
+                    print(f"DEBUG: Component verified by AI as {final_label} (original: {det['label']})")
+                else:
+                    # AI verification failed - fall back to expert model detection
+                    final_label = det['label']
+                    final_conf = det['confidence']
+                    print(f"DEBUG: AI verification failed, using expert model: {final_label}")
                 
                 verified_candidates.append({
                     'bbox': bbox,
@@ -225,6 +222,56 @@ class PIDImageAnalyzer:
                     'confidence': final_conf,
                     'source': det['source']
                 })
+            
+            # Apply refinement steps from old pipeline for better accuracy
+            print(f"Before refinement: {len(verified_candidates)} candidates")
+            
+            try:
+                # Convert to format expected by refinement functions
+                refined_detections = []
+                for det in verified_candidates:
+                    refined_detections.append({
+                        'bbox': det['bbox'],
+                        'label': det['label'],
+                        'category': det['label'],  # For compatibility
+                        'confidence': det['confidence'],
+                        'source': det['source']
+                    })
+                
+                # Apply deduplication with balanced threshold
+                deduped = self._dedupe_detections(refined_detections, iou_threshold=0.45)
+                print(f"After deduplication: {len(deduped)} detections")
+                
+                # Apply close merge with balanced threshold
+                merged = self._merge_close_detections(deduped, distance_ratio=0.20)
+                print(f"After close merge: {len(merged)} detections")
+                
+                # Apply additional IoU merge for all components
+                merged = self._aggressive_iou_merge(merged, iou_threshold=0.35)
+                print(f"After IoU merge: {len(merged)} detections")
+                
+                # Apply stacked tank merge
+                merged = self._merge_stacked_tank_symbols(merged)
+                print(f"After stacked tank merge: {len(merged)} detections")
+                
+                # Apply tank consolidation
+                image_area = float(image.shape[0] * image.shape[1])
+                consolidated = self._consolidate_tank_vessels(merged, image_area=image_area)
+                print(f"After consolidation: {len(consolidated)} detections")
+                
+                # Convert back to verified_candidates format
+                verified_candidates = []
+                for det in consolidated:
+                    verified_candidates.append({
+                        'bbox': det['bbox'],
+                        'label': det['label'],
+                        'confidence': det['confidence'],
+                        'source': det['source']
+                    })
+            except Exception as e:
+                print(f"Refinement failed, using original candidates: {e}")
+                # If refinement fails, use original candidates
+                pass
             
             # Prepare dino_results dict for the heuristic engine
             dino_results = {
@@ -781,6 +828,7 @@ class PIDImageAnalyzer:
                 If NO, provide the correct classification from: tank, valve, pump, motor, instrument, or other.
                 """
                 
+                # Try Gemini first
                 try:
                     response = self.gemini_client.generate_content(
                         [prompt, {"mime_type": "image/jpeg", "data": crop_str}],
@@ -809,10 +857,60 @@ class PIDImageAnalyzer:
                             'label': verified_label,
                             'confidence': 0.85 if verified_label == current_label else 0.75,
                             'verified': True,
-                            'tokens': tokens
+                            'tokens': tokens,
+                            'provider': 'gemini'
                         }
                 except Exception as e:
                     print(f"DEBUG: Gemini verification failed for component {current_label}: {e}")
+                    # Fallback to OpenAI
+                    if self.openai_client:
+                        try:
+                            print(f"DEBUG: Falling back to OpenAI for component {current_label}")
+                            response = self.openai_client.chat.completions.create(
+                                model=OPENAI_MODEL,
+                                messages=[
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": prompt},
+                                            {
+                                                "type": "image_url",
+                                                "image_url": {
+                                                    "url": f"data:image/jpeg;base64,{crop_str}"
+                                                }
+                                            }
+                                        ]
+                                    }
+                                ],
+                                temperature=OPENAI_TEMPERATURE,
+                                max_tokens=100
+                            )
+                            
+                            if response and response.choices:
+                                response_text = response.choices[0].message.content.strip().lower()
+                                verified_label = current_label
+                                
+                                # Parse response: if OpenAI says "no", extract the new correct label
+                                if 'no' in response_text:
+                                    for option in ['valve', 'tank', 'pump', 'motor', 'instrument', 'other']:
+                                        if option in response_text:
+                                            verified_label = option
+                                            break
+                                
+                                print(f"DEBUG: OpenAI verification response: '{response_text.strip()}' -> final label: '{verified_label}' (suggested: '{current_label}')")
+                                
+                                tokens = response.usage.total_tokens if response.usage else 0
+                                
+                                return {
+                                    'bbox': bbox,
+                                    'label': verified_label,
+                                    'confidence': 0.85 if verified_label == current_label else 0.75,
+                                    'verified': True,
+                                    'tokens': tokens,
+                                    'provider': 'openai'
+                                }
+                        except Exception as openai_error:
+                            print(f"DEBUG: OpenAI fallback also failed for component {current_label}: {openai_error}")
                     
                 return None
             
@@ -826,7 +924,15 @@ class PIDImageAnalyzer:
                         verified_detections.append(res)
                         total_tokens += res.get('tokens', 0)
                         
-            print(f"Gemini verified {len(verified_detections)} components, total tokens used: {total_tokens}")
+            # Count providers
+            gemini_count = sum(1 for d in verified_detections if d.get('provider') == 'gemini')
+            openai_count = sum(1 for d in verified_detections if d.get('provider') == 'openai')
+            
+            print(f"Gemini verified {gemini_count} components, OpenAI verified {openai_count} components, total tokens used: {total_tokens}")
+            
+            # Save token usage to file
+            self._save_token_usage(total_tokens, gemini_count, openai_count)
+            
             return {
                 'verified_detections': verified_detections,
                 'total_verified': len(verified_detections),
@@ -840,6 +946,389 @@ class PIDImageAnalyzer:
                 'total_verified': 0,
                 'total_tokens': 0
             }
+    
+    def _save_token_usage(self, total_tokens: int, gemini_count: int, openai_count: int):
+        """Save token usage to a .txt file"""
+        try:
+            token_file = Path(__file__).parent.parent / "token_usage.txt"
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            entry = f"{timestamp} - Total tokens: {total_tokens}, Gemini verifications: {gemini_count}, OpenAI verifications: {openai_count}\n"
+            
+            with open(token_file, "a", encoding="utf-8") as f:
+                f.write(entry)
+                
+            print(f"Token usage saved to {token_file}")
+        except Exception as e:
+            print(f"Failed to save token usage: {e}")
+    
+    def _iou(self, box1: List[float], box2: List[float]) -> float:
+        """Calculate IoU between two bounding boxes in [x1, y1, x2, y2] format"""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Calculate intersection
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Calculate union
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def _dedupe_detections(self, detections: List[Dict], iou_threshold: float = 0.50) -> List[Dict]:
+        """Remove duplicate detections using IoU within the same category."""
+        if not detections:
+            return []
+        
+        ordered = sorted(detections, key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+        kept = []
+        for candidate in ordered:
+            try:
+                candidate_box = candidate["bbox"]
+                if not candidate_box or len(candidate_box) != 4:
+                    continue
+                category = candidate.get("label", candidate.get("category", "unknown"))
+                duplicate = False
+                for existing in kept:
+                    existing_category = existing.get("label", existing.get("category", "unknown"))
+                    if existing_category != category:
+                        continue
+                    existing_box = existing.get("bbox")
+                    if not existing_box or len(existing_box) != 4:
+                        continue
+                    if self._iou(candidate_box, existing_box) >= iou_threshold:
+                        duplicate = True
+                        break
+                if not duplicate:
+                    kept.append(candidate)
+            except Exception as e:
+                print(f"Error in dedupe for detection: {e}")
+                kept.append(candidate)  # Keep detection if there's an error
+        return kept
+    
+    def _aggressive_iou_merge(self, detections: List[Dict], iou_threshold: float = 0.30) -> List[Dict]:
+        """Aggressively merge detections with IoU overlap for all components."""
+        if not detections:
+            return []
+        
+        try:
+            ordered = sorted(detections, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+            kept = []
+            
+            for det in ordered:
+                try:
+                    bx = det.get("bbox")
+                    if not bx or len(bx) != 4:
+                        kept.append(det)
+                        continue
+                    category = det.get("label", det.get("category", "unknown"))
+                    duplicate = False
+                    
+                    for ex in kept:
+                        try:
+                            ex_category = ex.get("label", ex.get("category", "unknown"))
+                            if ex_category != category:
+                                continue
+                            
+                            ex_box = ex.get("bbox")
+                            if not ex_box or len(ex_box) != 4:
+                                continue
+                            
+                            iou_score = self._iou(bx, ex_box)
+                            if iou_score >= iou_threshold:
+                                duplicate = True
+                                break
+                        except Exception as e:
+                            print(f"Error in aggressive IoU comparison: {e}")
+                            continue
+                    
+                    if not duplicate:
+                        kept.append(det)
+                except Exception as e:
+                    print(f"Error in aggressive IoU for detection: {e}")
+                    kept.append(det)  # Keep detection if there's an error
+            
+            return kept
+        except Exception as e:
+            print(f"Aggressive IoU merge failed, returning original: {e}")
+            return detections
+    
+    def _merge_close_detections(self, detections: List[Dict], distance_ratio: float = 0.15) -> List[Dict]:
+        """Merge detections of the same category when their centers are very close."""
+        if not detections:
+            return []
+        
+        try:
+            ordered = sorted(detections, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+            kept = []
+            
+            def center(box):
+                try:
+                    x1, y1, x2, y2 = box
+                    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                except:
+                    return (0, 0)
+            
+            def box_size(box):
+                try:
+                    x1, y1, x2, y2 = box
+                    return max(x2 - x1, y2 - y1)
+                except:
+                    return 1.0
+            
+            for det in ordered:
+                try:
+                    bx = det.get("bbox")
+                    if not bx or len(bx) != 4:
+                        kept.append(det)
+                        continue
+                    bx_c = center(bx)
+                    bw = box_size(bx)
+                    category = det.get("label", det.get("category", "unknown"))
+                    duplicate = False
+                    
+                    for ex in kept:
+                        try:
+                            ex_category = ex.get("label", ex.get("category", "unknown"))
+                            if ex_category != category:
+                                continue
+                            
+                            ex_box = ex.get("bbox")
+                            if not ex_box or len(ex_box) != 4:
+                                continue
+                            
+                            ex_c = center(ex_box)
+                            ex_bw = box_size(ex_box)
+                            
+                            iou_score = self._iou(bx, ex_box)
+                            if iou_score > 0.6:
+                                duplicate = True
+                                break
+                            
+                            thresh_ratio = distance_ratio
+                            if category == "tank":
+                                thresh_ratio = min(distance_ratio, 0.25)
+                            thresh = max(bw, ex_bw) * thresh_ratio
+                            dist = math.hypot(bx_c[0] - ex_c[0], bx_c[1] - ex_c[1])
+                            if dist <= thresh:
+                                duplicate = True
+                                break
+                        except Exception as e:
+                            print(f"Error in merge comparison: {e}")
+                            continue
+                    
+                    if not duplicate:
+                        kept.append(det)
+                except Exception as e:
+                    print(f"Error in merge for detection: {e}")
+                    kept.append(det)  # Keep detection if there's an error
+            
+            return kept
+        except Exception as e:
+            print(f"Merge close detections failed, returning original: {e}")
+            return detections
+    
+    def _merge_stacked_tank_symbols(self, detections: List[Dict]) -> List[Dict]:
+        """Merge vertical+horizontal parts of the same P&ID vessel into one tank detection."""
+        try:
+            tanks = [d for d in detections if d.get("label", d.get("category", "")) == "tank"]
+            others = [d for d in detections if d.get("label", d.get("category", "")) != "tank"]
+            
+            if len(tanks) <= 1:
+                return detections
+            
+            ordered = sorted(tanks, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+            kept = []
+            
+            def x_overlap(a, b):
+                try:
+                    x1_1, y1_1, x2_1, y2_1 = a
+                    x1_2, y1_2, x2_2, y2_2 = b
+                    w1, w2 = x2_1 - x1_1, x2_2 - x1_2
+                    inter = max(0, min(x2_1, x2_2) - max(x1_1, x1_2))
+                    union = w1 + w2 - inter
+                    return inter / union if union > 0 else 0.0
+                except:
+                    return 0.0
+            
+            for det in ordered:
+                try:
+                    box = det.get("bbox")
+                    if not box or len(box) != 4:
+                        kept.append(det)
+                        continue
+                    
+                    x1, y1, x2, y2 = box
+                    w, h = x2 - x1, y2 - y1
+                    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    duplicate = False
+                    
+                    for ex in kept:
+                        try:
+                            ex_box = ex.get("bbox")
+                            if not ex_box or len(ex_box) != 4:
+                                continue
+                            
+                            ex1, ey1, ex2, ey2 = ex_box
+                            ew, eh = ex2 - ex1, ey2 - ey1
+                            ecx, ecy = (ex1 + ex2) / 2.0, (ey1 + ey2) / 2.0
+                            
+                            if x_overlap(box, ex_box) < 0.35:
+                                continue
+                            
+                            # Do not merge separate horizontal drums on the same feed line
+                            if w >= h * 2.5 and ew >= eh * 2.5:
+                                continue
+                            
+                            vert_gap = abs(cy - ecy)
+                            max_dim = max(w, h, ew, eh)
+                            if vert_gap <= max_dim * 2.5:
+                                duplicate = True
+                                break
+                        except Exception as e:
+                            print(f"Error in stacked tank comparison: {e}")
+                            continue
+                    
+                    if not duplicate:
+                        kept.append(det)
+                except Exception as e:
+                    print(f"Error in stacked tank for detection: {e}")
+                    kept.append(det)  # Keep detection if there's an error
+            
+            return others + kept
+        except Exception as e:
+            print(f"Merge stacked tank symbols failed, returning original: {e}")
+            return detections
+    
+    def _consolidate_tank_vessels(self, detections: List[Dict], image_area: float = None) -> List[Dict]:
+        """Keep primary vessel(s); drop small false tank hits (controllers, caps, internals)."""
+        try:
+            tanks = [d for d in detections if d.get("label", d.get("category", "")) == "tank"]
+            others = [d for d in detections if d.get("label", d.get("category", "")) != "tank"]
+            
+            if len(tanks) <= 1:
+                return detections
+            
+            def size(det):
+                try:
+                    box = det.get("bbox") or (0, 0, 0, 0)
+                    x1, y1, x2, y2 = box
+                    return float((x2 - x1) * (y2 - y1))
+                except:
+                    return 100.0
+            
+            # Drop oversized outliers
+            if image_area is not None and image_area > 0 and len(tanks) > 1:
+                try:
+                    max_reasonable_tank_area = image_area * 0.18
+                    non_outlier_tanks = [det for det in tanks if size(det) <= max_reasonable_tank_area]
+                    if non_outlier_tanks:
+                        dropped_outliers = len(tanks) - len(non_outlier_tanks)
+                        if dropped_outliers > 0:
+                            print(f"Consolidation dropped {dropped_outliers} oversized tank outlier(s)")
+                        tanks = non_outlier_tanks
+                except Exception as e:
+                    print(f"Error in outlier removal: {e}")
+            
+            if len(tanks) <= 1:
+                return others + tanks
+            
+            try:
+                tank_sizes = [size(t) for t in tanks]
+                max_size = max(tank_sizes) if tank_sizes else 100.0
+                reference_size = float(np.median(tank_sizes)) if tank_sizes else 100.0
+                min_keep = max(
+                    reference_size * 0.70,  # Balanced threshold
+                    (image_area or 0.0) * 0.00025,  # Balanced threshold
+                    350.0,  # Balanced threshold
+                )
+                min_keep = min(min_keep, max_size)
+            except Exception as e:
+                print(f"Error calculating min_keep: {e}")
+                min_keep = 350.0
+            
+            kept = []
+            for det in sorted(tanks, key=size, reverse=True):
+                try:
+                    if size(det) < min_keep:
+                        continue
+                    box = det.get("bbox")
+                    if not box or len(box) != 4:
+                        kept.append(det)
+                        continue
+                    
+                    duplicate = False
+                    for ex in kept:
+                        try:
+                            ex_box = ex.get("bbox")
+                            if not ex_box or len(ex_box) != 4:
+                                continue
+                            if self._iou(box, ex_box) >= 0.12:  # Balanced IoU threshold
+                                duplicate = True
+                                break
+                        except Exception as e:
+                            print(f"Error in consolidation comparison: {e}")
+                            continue
+                    
+                    if not duplicate:
+                        kept.append(det)
+                except Exception as e:
+                    print(f"Error in consolidation for detection: {e}")
+                    kept.append(det)  # Keep detection if there's an error
+            
+            if len(kept) <= 1:
+                return others + kept
+            
+            # Column deduplication
+            column_kept = []
+            for det in sorted(kept, key=size, reverse=True):
+                try:
+                    box = det.get("bbox")
+                    if not box or len(box) != 4:
+                        column_kept.append(det)
+                        continue
+                    
+                    x1, y1, x2, y2 = box
+                    cx = (x1 + x2) / 2.0
+                    duplicate_column = False
+                    
+                    for existing in column_kept:
+                        try:
+                            ex_box = existing.get("bbox")
+                            if not ex_box or len(ex_box) != 4:
+                                continue
+                            
+                            ex1, ey1, ex2, ey2 = ex_box
+                            ex_cx = (ex1 + ex2) / 2.0
+                            
+                            if abs(cx - ex_cx) <= max(box[2] - box[0], ex_box[2] - ex_box[0]) * 0.75:  # Balanced column threshold
+                                size_ratio = size(det) / max(size(existing), 1.0)
+                                if size_ratio >= 0.33 and size_ratio <= 3.0:  # Balanced size ratio
+                                    duplicate_column = True
+                                    break
+                        except Exception as e:
+                            print(f"Error in column deduplication comparison: {e}")
+                            continue
+                    
+                    if not duplicate_column:
+                        column_kept.append(det)
+                except Exception as e:
+                    print(f"Error in column deduplication for detection: {e}")
+                    column_kept.append(det)  # Keep detection if there's an error
+            
+            return others + column_kept
+        except Exception as e:
+            print(f"Consolidate tank vessels failed, returning original: {e}")
+            return detections
     
     def _heuristic_engine(self, opencv_results: Dict, ocr_results: Dict, 
                           florence_results: Dict, dino_results: Dict, image: np.ndarray = None) -> Dict[str, Any]:
