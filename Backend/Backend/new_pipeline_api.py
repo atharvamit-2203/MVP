@@ -135,6 +135,19 @@ class NewPipelineAnalyzer:
         if validated_components:
             print(f"DEBUG: Sample component: {validated_components[0]}")
         
+        # Check if cyclone was detected - if so, suppress pipe count since OpenCV picks up cyclone edges as false positives
+        has_cyclone = any('cyclone' in comp.get('label', '').lower() for comp in validated_components)
+        
+        # Also suppress pipes if very few connected pipes (indicates no actual pipes in diagram)
+        # Use the actual connected pipe count from OpenCV, not the line count
+        total_pipes = opencv_results.get('total_pipes', 0)
+        
+        # More aggressive pipe suppression: if total connected pipes is very low (< 3)
+        has_few_pipes = total_pipes < 3
+        
+        pipe_count = 0 if has_cyclone or has_few_pipes else total_pipes
+        print(f"DEBUG: Pipe suppression - has_cyclone: {has_cyclone}, total_pipes: {total_pipes}, has_few_pipes: {has_few_pipes}, final_pipe_count: {pipe_count}")
+        
         counts = {
             'motor': 0,
             'pump': 0,
@@ -142,7 +155,7 @@ class NewPipelineAnalyzer:
             'valve': 0,
             'instrument': 0,
             'other': 0,
-            'pipe': opencv_results.get('total_pipes', 0)  # Add pipe count
+            'pipe': pipe_count
         }
         
         # Count components by type
@@ -157,6 +170,8 @@ class NewPipelineAnalyzer:
                 counts['tank'] += 1
             elif 'motor' in label:
                 counts['motor'] += 1
+            elif 'cyclone' in label or 'separator' in label:
+                counts['other'] += 1
             elif 'instrument' in label or 'sensor' in label or 'tag' in label:
                 counts['instrument'] += 1
             else:
@@ -174,11 +189,14 @@ class NewPipelineAnalyzer:
             bbox = component.get('bbox', [0, 0, 0, 0])
             if len(bbox) == 4:
                 x, y, x2, y2 = bbox
+                classification = component.get('classification', {})
+                print(f"DEBUG: Building detection for {component.get('label')}, classification: {classification}")
                 detections.append({
                     'name': component.get('label', 'Unknown'),
                     'category': self._infer_category(component.get('label', '')),
                     'bbox': [int(x), int(y), int(x2 - x), int(y2 - y)],
-                    'confidence': component.get('confidence', 0.5)
+                    'confidence': component.get('confidence', 0.5),
+                    'classification': classification
                 })
         
         # Add OCR text as components
@@ -244,6 +262,9 @@ class NewPipelineAnalyzer:
         """Build coordinate structure in frontend format"""
         width, height = image.size
         
+        # Check if cyclone is detected - if so, suppress pipe lines
+        has_cyclone = any('cyclone' in d.get('name', '').lower() for d in detections)
+        
         children = []
         for i, detection in enumerate(detections):
             bbox = detection.get('bbox', [0, 0, 0, 0])
@@ -254,10 +275,34 @@ class NewPipelineAnalyzer:
                 w = max(0, float(w))
                 h = max(0, float(h))
                 
-                # Convert to percentage or keep as pixels
-                # Frontend expects pixels in the current implementation
+                label = detection.get('name', '').lower()
+                category = detection.get('category', '')
+                classification = detection.get('classification', {})
+                
+                # Determine component type and props based on whether it's standard or custom
+                if classification.get('classification') == 'customized':
+                    # Custom component - use ia.display.view with template path
+                    template_path = classification.get('template_path', f'Template/{label.capitalize()}/{label.capitalize()}')
+                    component_type = 'ia.display.view'
+                    props = {'path': template_path}
+                else:
+                    # Standard component - use specific symbol type
+                    if 'valve' in label or category == 'valve':
+                        component_type = 'ia.symbol.valve'
+                    elif 'pump' in label or category == 'pump':
+                        component_type = 'ia.symbol.pump'
+                    elif 'tank' in label or category == 'tank':
+                        component_type = 'ia.symbol.tank'
+                    elif 'motor' in label or category == 'motor':
+                        component_type = 'ia.symbol.motor'
+                    elif 'instrument' in label or category == 'instrument':
+                        component_type = 'ia.symbol.instrument'
+                    else:
+                        component_type = 'ia.symbol.basic'
+                    props = {}
+                
                 children.append({
-                    'type': 'ia.symbol.basic',
+                    'type': component_type,
                     'meta': {
                         'name': detection.get('name', f'Component_{i}')
                     },
@@ -267,39 +312,40 @@ class NewPipelineAnalyzer:
                         'width': w,
                         'height': h
                     },
-                    'props': {}
+                    'props': props
                 })
         
-        # Add pipe lines as connections
-        lines = opencv_results.get('lines', [])
-        for line in lines:
-            if line.get('is_pipe', False):
-                start = line.get('start', [0, 0])
-                end = line.get('end', [0, 0])
-                line_width = max(0, float(end[0] - start[0]))
-                line_height = max(0, float(end[1] - start[1]))
-                children.append({
-                    'type': 'ia.shape.line',
-                    'meta': {
-                        'name': f'Pipe_{len(children)}'
-                    },
-                    'position': {
-                        'x': float(start[0]),
-                        'y': float(start[1]),
-                        'width': line_width,
-                        'height': line_height
-                    },
-                    'props': {
-                        'stroke': '#000000',
-                        'strokeWidth': 2
-                    }
-                })
+        # Add pipe lines as connections (suppress if cyclone detected)
+        if not has_cyclone:
+            lines = opencv_results.get('lines', [])
+            for line in lines:
+                if line.get('is_pipe', False):
+                    start = line.get('start', [0, 0])
+                    end = line.get('end', [0, 0])
+                    line_width = max(0, float(end[0] - start[0]))
+                    line_height = max(0, float(end[1] - start[1]))
+                    children.append({
+                        'type': 'ia.shape.line',
+                        'meta': {
+                            'name': f'Pipe_{len(children)}'
+                        },
+                        'position': {
+                            'x': float(start[0]),
+                            'y': float(start[1]),
+                            'width': line_width,
+                            'height': line_height
+                        },
+                        'props': {
+                            'stroke': '#000000',
+                            'strokeWidth': 2
+                        }
+                    })
         
         return {
             'root': {
-                'type': 'ia.cloud',
+                'type': 'ia.container.coord',
                 'meta': {
-                    'name': 'P&ID Components'
+                    'name': 'root'
                 },
                 'children': children,
                 'position': {},
